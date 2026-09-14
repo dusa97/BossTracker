@@ -2,3 +2,4 @@ boss_tracker_data.json
 __pycache__/
 *.pyc
 .venv/
+.idea/
