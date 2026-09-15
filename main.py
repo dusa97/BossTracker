@@ -37,7 +37,7 @@ SOURCES_ASSETS_DIR = os.path.join(_BASE_DIR, "sources")
 DATA_FILE        = os.path.join(_BASE_DIR, "boss_tracker_data.json")
 _BM_PATH = os.path.join(BOSS_ASSETS_DIR, "BlackMage.png")
 NUM_WEEKS_TO_SHOW = 4
-APP_VERSION = "v1.25"
+APP_VERSION = "v1.26"
 
 # Item Scanner (F9 tooltip capture/OCR) is built but hidden from the UI for now — flip to True
 # to bring back the tab and the F9 global hotkey. Nothing else needs to change.
