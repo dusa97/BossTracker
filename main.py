@@ -1,6 +1,8 @@
 # Build: run build.bat, or: pyinstaller --onefile --noconsole --noupx --name BossTracker --icon=icon.ico main.py
+import copy
 import ctypes
 from ctypes import wintypes
+import functools
 import io
 import json
 import os
@@ -8,14 +10,14 @@ import re
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import numpy as np
 from PIL import Image, ImageEnhance
 from PyQt6.QtCore import (
     Qt, QMimeData, QTimer, QPoint, QEvent, QRect, QSize, QThread, pyqtSignal,
     QBuffer, QIODevice,
 )
-from PyQt6.QtGui import QDrag, QPixmap, QPainter, QColor, QIcon
+from PyQt6.QtGui import QDrag, QPixmap, QPainter, QColor, QIcon, QLinearGradient, QFont
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QScrollArea, QFrame, QPushButton, QInputDialog,
@@ -33,7 +35,9 @@ ITEMS_ASSETS_DIR  = os.path.join(_BASE_DIR, "assets")
 BOSS_ASSETS_DIR   = os.path.join(_BASE_DIR, "boss")
 SOURCES_ASSETS_DIR = os.path.join(_BASE_DIR, "sources")
 DATA_FILE        = os.path.join(_BASE_DIR, "boss_tracker_data.json")
+_BM_PATH = os.path.join(BOSS_ASSETS_DIR, "BlackMage.png")
 NUM_WEEKS_TO_SHOW = 4
+APP_VERSION = "v1.25"
 
 # Item Scanner (F9 tooltip capture/OCR) is built but hidden from the UI for now — flip to True
 # to bring back the tab and the F9 global hotkey. Nothing else needs to change.
@@ -200,13 +204,28 @@ def _fmt_meso_short(n):
     return f"{n:,}"
 
 
+@functools.lru_cache(maxsize=None)
+def _boss_files():
+    """(full_path, lowercase_key, display_name) for every boss PNG, sorted by filename."""
+    if not os.path.isdir(BOSS_ASSETS_DIR):
+        return ()
+    return tuple(
+        (os.path.join(BOSS_ASSETS_DIR, f), os.path.splitext(f)[0].lower(), os.path.splitext(f)[0])
+        for f in sorted(os.listdir(BOSS_ASSETS_DIR)) if f.lower().endswith('.png')
+    )
+
+
+@functools.lru_cache(maxsize=512)
+def _scaled_pixmap(path, size):
+    return QPixmap(path).scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio,
+                                Qt.TransformationMode.SmoothTransformation)
+
+
 class DraggableAssetItem(QLabel):
-    def __init__(self, name, image_path, assigned_date=None, right_click_cb=None, show_price=False):
+    def __init__(self, name, image_path, show_price=False):
         super().__init__()
         self.name = name
         self.image_path = image_path
-        self.assigned_date = assigned_date
-        self.right_click_cb = right_click_cb
 
         self.setFixedSize(70, 80)
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -223,9 +242,7 @@ class DraggableAssetItem(QLabel):
         layout.setSpacing(2)
 
         self.img_label = QLabel()
-        base_pixmap = QPixmap(image_path).scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio,
-                                                 Qt.TransformationMode.SmoothTransformation)
-        self.img_label.setPixmap(base_pixmap)
+        self.img_label.setPixmap(_scaled_pixmap(image_path, 32))
         self.img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.img_label)
 
@@ -263,8 +280,7 @@ class ClickableCellIcon(QWidget):
         self.img_label.setFixedSize(35, 35)
         self.img_label.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        base_pixmap = QPixmap(image_path).scaled(35, 35, Qt.AspectRatioMode.KeepAspectRatio,
-                                                 Qt.TransformationMode.SmoothTransformation)
+        base_pixmap = _scaled_pixmap(image_path, 35)
 
         item_stem = os.path.splitext(os.path.basename(image_path))[0].lower()
         overlay_name = SPECIAL_ITEM_OVERLAYS.get(item_stem)
@@ -310,8 +326,7 @@ class ClickableCellIcon(QWidget):
                 overlay_path = os.path.join(ITEMS_ASSETS_DIR, f"{overlay_name}.png")
                 if os.path.exists(overlay_path):
                     final_pixmap = QPixmap(final_pixmap)
-                    overlay_pixmap = QPixmap(overlay_path).scaled(
-                        18, 18, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                    overlay_pixmap = _scaled_pixmap(overlay_path, 18)
                     painter = QPainter(final_pixmap)
                     painter.drawPixmap(35 - overlay_pixmap.width(), 35 - overlay_pixmap.height(), overlay_pixmap)
                     painter.end()
@@ -409,8 +424,7 @@ class BlackMageToggle(QLabel):
         self.setFixedSize(35, 35)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        base_pixmap = QPixmap(image_path).scaled(35, 35, Qt.AspectRatioMode.KeepAspectRatio,
-                                                  Qt.TransformationMode.SmoothTransformation)
+        base_pixmap = _scaled_pixmap(image_path, 35)
         if is_done:
             self.setPixmap(base_pixmap)
             self.setStyleSheet("border: 2px solid #2ecc71; border-radius: 4px;")
@@ -437,7 +451,7 @@ class BlackMageToggle(QLabel):
 
 class DynamicCalendarCell(QFrame):
     def __init__(self, char_id, week_key, is_current_week, drop_cb, left_click_cb, right_click_cb,
-                 cell_right_click_cb=None, party_click_cb=None, wrap_cols=None, min_size=None):
+                 party_click_cb=None, wrap_cols=None, min_size=None):
         super().__init__()
         self.char_id = char_id
         self.week_key = week_key
@@ -445,7 +459,6 @@ class DynamicCalendarCell(QFrame):
         self.drop_cb = drop_cb
         self.left_click_cb = left_click_cb
         self.right_click_cb = right_click_cb
-        self.cell_right_click_cb = cell_right_click_cb
         self.party_click_cb = party_click_cb
         self.wrap_cols = wrap_cols
         self._icon_count = 0
@@ -511,12 +524,6 @@ class DynamicCalendarCell(QFrame):
             event.acceptProposedAction()
         self.setStyleSheet(self.default_style)
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.RightButton and self.cell_right_click_cb is not None:
-            self.cell_right_click_cb(self.char_id, self.week_key)
-        else:
-            super().mousePressEvent(event)
-
 
 class BossHoverPreview(QWidget):
     def __init__(self):
@@ -580,8 +587,7 @@ class BossHoverPreview(QWidget):
 
                 img_lbl = QLabel()
                 img_lbl.setFixedSize(42, 42)
-                pix = QPixmap(img_path).scaled(42, 42, Qt.AspectRatioMode.KeepAspectRatio,
-                                               Qt.TransformationMode.SmoothTransformation)
+                pix = _scaled_pixmap(img_path, 42)
                 if is_inherited:
                     faded = QPixmap(pix.size())
                     faded.fill(Qt.GlobalColor.transparent)
@@ -625,21 +631,12 @@ class BossHoverPreview(QWidget):
         crystal_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self._grid.addWidget(crystal_lbl, num_rows + 1, 0, 1, 2)
 
-        meso_str = self._fmt_meso(weekly_meso)
-        meso_lbl = QLabel(f"Meso: {meso_str}")
+        meso_lbl = QLabel(f"Meso: {_fmt_meso_short(weekly_meso)}")
         meso_lbl.setStyleSheet("color: #f0c040; font-size: 10px; font-weight: bold; background: transparent; border: none;")
         meso_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._grid.addWidget(meso_lbl, num_rows + 1, 2)
 
         self.adjustSize()
-
-    @staticmethod
-    def _fmt_meso(n):
-        if n >= 1_000_000_000:
-            return f"{n / 1_000_000_000:.2f}B"
-        if n >= 1_000_000:
-            return f"{n / 1_000_000:.1f}M"
-        return f"{n:,}"
 
 
 class CharacterProfileCard(QFrame):
@@ -681,9 +678,8 @@ class CharacterProfileCard(QFrame):
         name_row.addWidget(name_lbl)
 
         if blackmage_click_cb is not None:
-            bm_path = os.path.join(BOSS_ASSETS_DIR, "BlackMage.png")
-            if os.path.exists(bm_path):
-                bm_toggle = BlackMageToggle(bm_path, blackmage_done, blackmage_difficulty,
+            if os.path.exists(_BM_PATH):
+                bm_toggle = BlackMageToggle(_BM_PATH, blackmage_done, blackmage_difficulty,
                                             click_cb=blackmage_click_cb,
                                             right_click_cb=blackmage_edit_cb or (lambda: None))
                 name_row.addWidget(bm_toggle)
@@ -841,7 +837,6 @@ class MesoBarChart(QWidget):
         self.update()
 
     def paintEvent(self, event):
-        from PyQt6.QtGui import QLinearGradient, QFont
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.fillRect(self.rect(), QColor("#1a1a1a"))
@@ -861,6 +856,9 @@ class MesoBarChart(QWidget):
 
         slot_w = cw / n
         bar_w = slot_w * 0.55
+        f_val = QFont("Segoe UI", 7)
+        f_val.setBold(True)
+        f_lbl = QFont("Segoe UI", 8)
 
         for i, (label, val) in enumerate(self._data):
             x = ml + i * slot_w + (slot_w - bar_w) / 2
@@ -874,15 +872,11 @@ class MesoBarChart(QWidget):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawRoundedRect(int(x), int(y), int(bar_w), int(bh) + 1, 3, 3)
 
-            f_val = QFont("Segoe UI", 7)
-            f_val.setBold(True)
             painter.setFont(f_val)
             painter.setPen(QColor("#f0c040"))
-            val_str = self._fmt(val)
             painter.drawText(int(x - 4), int(y) - 16, int(bar_w + 8), 16,
-                             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom, val_str)
+                             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom, self._fmt(val))
 
-            f_lbl = QFont("Segoe UI", 8)
             painter.setFont(f_lbl)
             painter.setPen(QColor("#b3b3b3"))
             painter.drawText(int(x - 4), mt + ch + 4, int(bar_w + 8), mb - 4,
@@ -1256,18 +1250,20 @@ class BossTrackerApp(QMainWindow):
             listener.stop()
         super().closeEvent(event)
 
+    def _active_bosses(self, cid, wkey, include_monthly=False):
+        """[(path, key, display_name, state, inherited)] for every boss live on this week."""
+        out = []
+        for path, key, raw in _boss_files():
+            if not include_monthly and key in MONTHLY_BOSSES:
+                continue
+            state, inherited = self.resolve_boss_state_at_week(cid, wkey, path)
+            if state and not state.get("is_deleted_marker", False):
+                out.append((path, key, raw, state, inherited))
+        return out
+
     def get_current_week_bosses(self, char_id):
-        week_key = self.actual_current_week_key
-        result = []
-        if not os.path.exists(BOSS_ASSETS_DIR):
-            return result
-        for f in sorted(os.listdir(BOSS_ASSETS_DIR)):
-            if f.lower().endswith('.png'):
-                full_path = os.path.join(BOSS_ASSETS_DIR, f)
-                boss_data, is_inherited = self.resolve_boss_state_at_week(char_id, week_key, full_path)
-                if boss_data and not boss_data.get("is_deleted_marker", False):
-                    result.append((full_path, boss_data["difficulty"], boss_data["party_size"], is_inherited))
-        return result
+        return [(p, s["difficulty"], s.get("party_size", 1), inh)
+                for p, _k, _r, s, inh in self._active_bosses(char_id, self.actual_current_week_key, include_monthly=True)]
 
     def _fire_hover_preview(self):
         char_id, card_widget = self._pending_hover
@@ -1316,8 +1312,10 @@ class BossTrackerApp(QMainWindow):
                 f"{k[0]}|{k[1]}": v for k, v in self.saved_boss_clears.items()
             },
         }
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
+        tmp = DATA_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f)
+        os.replace(tmp, DATA_FILE)
         self._resolve_cache.clear()
         self._stats_dirty = True
 
@@ -1370,8 +1368,16 @@ class BossTrackerApp(QMainWindow):
             global LABEL_FONT_SIZE
             LABEL_FONT_SIZE = data.get("label_font_size", 11)
             self._backfill_missing_dates()
-        except Exception:
-            pass
+        except Exception as e:
+            backup = DATA_FILE + ".corrupt"
+            try:
+                os.replace(DATA_FILE, backup)
+            except OSError:
+                pass
+            QMessageBox.critical(
+                self, "Data file unreadable",
+                f"Could not read {os.path.basename(DATA_FILE)}:\n{e}\n\n"
+                f"It was moved to {os.path.basename(backup)} so it won't be overwritten. Starting empty.")
 
     def _backfill_missing_dates(self):
         today = self._today_str()
@@ -1421,37 +1427,20 @@ class BossTrackerApp(QMainWindow):
         self.save_data()
 
     def _auto_populate_new_week(self):
-        if not os.path.exists(BOSS_ASSETS_DIR):
-            return
-        current_thu = self.actual_current_thursday
         current_week_key = self.actual_current_week_key
-        prev_week_key = (current_thu - timedelta(weeks=1)).strftime("%Y-%m-%d")
-
-        boss_files = [
-            (os.path.join(BOSS_ASSETS_DIR, f), os.path.splitext(f)[0].lower())
-            for f in sorted(os.listdir(BOSS_ASSETS_DIR))
-            if f.lower().endswith('.png')
-        ]
+        prev_week_key = (self.actual_current_thursday - timedelta(weeks=1)).strftime("%Y-%m-%d")
 
         changed = False
         for char in self.characters:
             cid = char["id"]
             if self.saved_boss_clears.get((cid, current_week_key)):
                 continue
-            new_entries = []
-            for full_path, fname_key in boss_files:
-                if fname_key in MONTHLY_BOSSES:
-                    # Monthly bosses (Black Mage) never auto-carry forward — they're marked
-                    # done explicitly, once per run, on whichever week the user checks them off.
-                    continue
-                state, _ = self.resolve_boss_state_at_week(cid, prev_week_key, full_path)
-                if state and not state.get("is_deleted_marker", False):
-                    new_entries.append({
-                        "path": full_path,
-                        "difficulty": state["difficulty"],
-                        "party_size": state.get("party_size", 1),
-                        "cleared": False,
-                    })
+            # Monthly bosses (Black Mage) never auto-carry forward — they're marked done
+            # explicitly, once per run, on whichever week the user checks them off.
+            new_entries = [
+                {"path": p, "difficulty": s["difficulty"], "party_size": s.get("party_size", 1), "cleared": False}
+                for p, _k, _r, s, _i in self._active_bosses(cid, prev_week_key)
+            ]
             if new_entries:
                 self.saved_boss_clears[(cid, current_week_key)] = new_entries
                 changed = True
@@ -1504,14 +1493,12 @@ class BossTrackerApp(QMainWindow):
         self.tab_item_scanner.setStyleSheet(btn_style)
         self.tab_item_scanner.setCheckable(True)
 
-        self.tab_tracker.clicked.connect(lambda: self.switch_global_tab(0))
-        self.tab_stats.clicked.connect(lambda: self.switch_global_tab(2))
-        self.tab_version_history.clicked.connect(lambda: self.switch_global_tab(3))
-        self.tab_all_tasks.clicked.connect(lambda: self.switch_global_tab(4))
-        self.tab_item_results.clicked.connect(lambda: self.switch_global_tab(5))
-        self.tab_pitched_items.clicked.connect(lambda: self.switch_global_tab(6))
-        if ENABLE_ITEM_SCANNER:
-            self.tab_item_scanner.clicked.connect(lambda: self.switch_global_tab(7))
+        self._tab_buttons = {
+            0: self.tab_tracker, 2: self.tab_stats, 3: self.tab_version_history, 4: self.tab_all_tasks,
+            5: self.tab_item_results, 6: self.tab_pitched_items, 7: self.tab_item_scanner,
+        }
+        for idx, btn in self._tab_buttons.items():
+            btn.clicked.connect(lambda _checked, i=idx: self.switch_global_tab(i))
 
         menu_hbox.addWidget(self.tab_tracker)
         menu_hbox.addWidget(self.tab_stats)
@@ -1549,7 +1536,7 @@ class BossTrackerApp(QMainWindow):
         menu_hbox.addWidget(btn_fs_plus)
         menu_hbox.addSpacing(10)
 
-        ver_lbl = QLabel("v1.18")
+        ver_lbl = QLabel(APP_VERSION)
         ver_lbl.setStyleSheet("color: #444444; font-size: 10px; font-weight: bold; padding: 2px 6px;")
         menu_hbox.addWidget(ver_lbl)
 
@@ -1580,73 +1567,18 @@ class BossTrackerApp(QMainWindow):
 
     def switch_global_tab(self, stack_idx):
         self.inline_calendar_drawer.setVisible(False)
+        for idx, btn in self._tab_buttons.items():
+            btn.setChecked(idx == stack_idx)
         if stack_idx == 0:
-            self.tab_tracker.setChecked(True)
-            self.tab_stats.setChecked(False)
-            self.tab_version_history.setChecked(False)
-            self.tab_all_tasks.setChecked(False)
-            self.tab_item_results.setChecked(False)
-            self.tab_pitched_items.setChecked(False)
-            self.tab_item_scanner.setChecked(False)
             self.return_to_overview()
-        elif stack_idx == 2:
-            self.tab_tracker.setChecked(False)
-            self.tab_stats.setChecked(True)
-            self.tab_version_history.setChecked(False)
-            self.tab_all_tasks.setChecked(False)
-            self.tab_item_results.setChecked(False)
-            self.tab_pitched_items.setChecked(False)
-            self.tab_item_scanner.setChecked(False)
-            self.view_stack.setCurrentIndex(2)
-            self.update_statistics_charts()
-        elif stack_idx == 3:
-            self.tab_tracker.setChecked(False)
-            self.tab_stats.setChecked(False)
-            self.tab_version_history.setChecked(True)
-            self.tab_all_tasks.setChecked(False)
-            self.tab_item_results.setChecked(False)
-            self.tab_pitched_items.setChecked(False)
-            self.tab_item_scanner.setChecked(False)
-            self.view_stack.setCurrentIndex(3)
-        elif stack_idx == 4:
-            self.tab_tracker.setChecked(False)
-            self.tab_stats.setChecked(False)
-            self.tab_version_history.setChecked(False)
-            self.tab_all_tasks.setChecked(True)
-            self.tab_item_results.setChecked(False)
-            self.tab_pitched_items.setChecked(False)
-            self.tab_item_scanner.setChecked(False)
-            self.view_stack.setCurrentIndex(4)
-            self.update_all_tasks_page()
-        elif stack_idx == 5:
-            self.tab_tracker.setChecked(False)
-            self.tab_stats.setChecked(False)
-            self.tab_version_history.setChecked(False)
-            self.tab_all_tasks.setChecked(False)
-            self.tab_item_results.setChecked(True)
-            self.tab_pitched_items.setChecked(False)
-            self.tab_item_scanner.setChecked(False)
-            self.view_stack.setCurrentIndex(5)
-            self.update_item_results_page()
-        elif stack_idx == 6:
-            self.tab_tracker.setChecked(False)
-            self.tab_stats.setChecked(False)
-            self.tab_version_history.setChecked(False)
-            self.tab_all_tasks.setChecked(False)
-            self.tab_item_results.setChecked(False)
-            self.tab_pitched_items.setChecked(True)
-            self.tab_item_scanner.setChecked(False)
-            self.view_stack.setCurrentIndex(6)
-            self.update_pitched_items_page()
-        elif stack_idx == 7:
-            self.tab_tracker.setChecked(False)
-            self.tab_stats.setChecked(False)
-            self.tab_version_history.setChecked(False)
-            self.tab_all_tasks.setChecked(False)
-            self.tab_item_results.setChecked(False)
-            self.tab_pitched_items.setChecked(False)
-            self.tab_item_scanner.setChecked(True)
-            self.view_stack.setCurrentIndex(7)
+            return
+        self.view_stack.setCurrentIndex(stack_idx)
+        refresh = {
+            2: self.update_statistics_charts, 4: self.update_all_tasks_page,
+            5: self.update_item_results_page, 6: self.update_pitched_items_page,
+        }.get(stack_idx)
+        if refresh:
+            refresh()
 
     def _change_label_font_size(self, delta):
         global LABEL_FONT_SIZE
@@ -2429,7 +2361,7 @@ class BossTrackerApp(QMainWindow):
 
         entry_style = "background-color: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 6px;"
 
-        for ver, date, changes in versions:
+        for ver, rel_date, changes in versions:
             entry = QFrame()
             entry.setStyleSheet(entry_style)
             entry_layout = QVBoxLayout(entry)
@@ -2440,7 +2372,7 @@ class BossTrackerApp(QMainWindow):
             ver_lbl = QLabel(ver)
             ver_lbl.setStyleSheet("color: #f0c040; font-size: 16px; font-weight: bold; background: transparent; border: none;")
             header_row.addWidget(ver_lbl)
-            date_lbl = QLabel(date)
+            date_lbl = QLabel(rel_date)
             date_lbl.setStyleSheet("color: #555555; font-size: 12px; background: transparent; border: none;")
             header_row.addWidget(date_lbl)
             header_row.addStretch()
@@ -2472,57 +2404,39 @@ class BossTrackerApp(QMainWindow):
     # FIXED PERSISTENT TIMELINE EVALUATION ENGINE (NON-RECURSIVE)
     # ==========================================
     def resolve_boss_state_at_week(self, char_id, target_week_str, boss_image_path):
-        """NEW: Evaluates chronological timeline paths strictly through a non-recursive list scan."""
+        """(state, inherited) for this boss on this week: the explicit stamp if there is one,
+        else the most recent earlier stamp (inherited), else None. Week keys are ISO dates, so
+        plain string comparison orders them correctly."""
         _cache_key = (char_id, target_week_str, boss_image_path)
         if _cache_key in self._resolve_cache:
             return self._resolve_cache[_cache_key]
+        result = self._resolve_cache[_cache_key] = self._resolve_uncached(char_id, target_week_str, boss_image_path)
+        return result
 
-        target_dt = datetime.strptime(target_week_str, "%Y-%m-%d").date()
-
-        fname_key = os.path.splitext(os.path.basename(boss_image_path))[0].lower()
-        is_monthly_boss_r = fname_key in MONTHLY_BOSSES
-
-        # Check if an explicit stamp override structure exists for this week column cell block
-        explicit_list = self.saved_boss_clears.get((char_id, target_week_str), [])
-        for b in explicit_list:
+    def _resolve_uncached(self, char_id, target_week_str, boss_image_path):
+        for b in self.saved_boss_clears.get((char_id, target_week_str), []):
             if b["path"] == boss_image_path:
-                result = (b, False)
-                self._resolve_cache[_cache_key] = result
-                return result
+                return b, False
 
         # Monthly bosses (e.g. Black Mage) are marked done once per run, on whichever exact
         # week the user checks it off — they never roll forward into other weeks.
-        if is_monthly_boss_r:
-            result = (None, False)
-            self._resolve_cache[_cache_key] = result
-            return result
+        # Future weeks never inherit either — bosses must be manually added each week.
+        fname_key = os.path.splitext(os.path.basename(boss_image_path))[0].lower()
+        if fname_key in MONTHLY_BOSSES or target_week_str > self.actual_current_week_key:
+            return None, False
 
-        # Future weeks never inherit — bosses must be manually added each week.
-        if target_dt > self.actual_current_thursday:
-            result = (None, False)
-            self._resolve_cache[_cache_key] = result
-            return result
+        best_wk, best = None, None
+        for (c, wk), stored_list in self.saved_boss_clears.items():
+            if c != char_id or wk >= target_week_str or (best_wk is not None and wk < best_wk):
+                continue
+            for b in stored_list:
+                if b["path"] == boss_image_path:
+                    best_wk, best = wk, b
+                    break
 
-        past_stamps = []
-        for key, stored_list in self.saved_boss_clears.items():
-            if key[0] == char_id:
-                entry_dt = datetime.strptime(key[1], "%Y-%m-%d").date()
-                if entry_dt < target_dt:
-                    for b in stored_list:
-                        if b["path"] == boss_image_path:
-                            past_stamps.append((entry_dt, b))
-
-        if past_stamps:
-            past_stamps.sort(key=lambda x: x[0], reverse=True)
-            closest_ancestor = past_stamps[0][1]
-            if not closest_ancestor.get("is_deleted_marker", False):
-                result = (closest_ancestor, True)
-                self._resolve_cache[_cache_key] = result
-                return result
-
-        result = (None, False)
-        self._resolve_cache[_cache_key] = result
-        return result
+        if best is not None and not best.get("is_deleted_marker", False):
+            return best, True
+        return None, False
 
     def _today_str(self):
         return datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -2543,15 +2457,11 @@ class BossTrackerApp(QMainWindow):
         link = task.get("linked")
         if not link:
             return
-        entries = self.char_item_results.get(link.get("char_id"), [])
-        item_idx, upg_idx = link.get("item_idx", -1), link.get("upg_idx", -1)
-        if not (0 <= item_idx < len(entries)):
+        upg = self._upgrade_at(link.get("char_id"), link.get("item_idx", -1), link.get("upg_idx", -1))
+        if upg is None:
             return
-        upgrades = entries[item_idx].get("upgrades", [])
-        if not (0 <= upg_idx < len(upgrades)):
-            return
-        upgrades[upg_idx]["done"] = done
-        upgrades[upg_idx]["closed"] = self._today_str() if done else None
+        upg["done"] = done
+        upg["closed"] = self._today_str() if done else None
 
     def _sync_linked_tasks_from_upgrade(self, char_id, item_idx, upg_idx, done):
         """When an Item Result upgrade is checked/unchecked, mirror the state onto any task linked to it."""
@@ -2657,49 +2567,28 @@ class BossTrackerApp(QMainWindow):
         if hasattr(self, '_all_item_results_todo_layout'):
             self.update_item_results_page()
 
-    def _fmt_meso(self, n):
-        if n >= 1_000_000_000:
-            return f"{n / 1_000_000_000:.2f}B"
-        if n >= 1_000_000:
-            return f"{n / 1_000_000:.1f}M"
-        return f"{n:,}"
+    def _recent_months(self, n=6):
+        """(year, month) for the last n calendar months, oldest first, ending with the current one."""
+        base = self.actual_current_thursday.year * 12 + self.actual_current_thursday.month - 1
+        return [((base - i) // 12, (base - i) % 12 + 1) for i in range(n - 1, -1, -1)]
 
-    def _refresh_weekly_meso_all(self):
-        if not hasattr(self, 'weekly_meso_chart'):
-            return
-        chart_data = []
-        table_rows = []
-        for i in range(7, -1, -1):
-            thu = self.actual_current_thursday - timedelta(weeks=i)
-            wkey = thu.strftime("%Y-%m-%d")
-            total = sum(
-                self.calculate_weekly_crystal_meso(c["id"], wkey)
-                for c in self.characters
-                if not self._is_char_excluded_at_week(c["id"], wkey)
-            )
-            label = thu.strftime("%b %d")
-            chart_data.append((label, total))
-            table_rows.append((label, total))
-        self.weekly_meso_chart.set_data(chart_data)
-        self.weekly_meso_table.setRowCount(0)
-        for label, total in reversed(table_rows):
-            row = self.weekly_meso_table.rowCount()
-            self.weekly_meso_table.insertRow(row)
-            self.weekly_meso_table.setItem(row, 0, QTableWidgetItem(label))
-            self.weekly_meso_table.setItem(row, 1, QTableWidgetItem(self._fmt_meso(total)))
+    def _month_week_keys(self, year, month):
+        """Week keys for every Thursday in this month that isn't in the future."""
+        first = date(year, month, 1)
+        thu = first + timedelta(days=(3 - first.weekday()) % 7)
+        keys = []
+        while thu.month == month and thu <= self.actual_current_thursday:
+            keys.append(thu.strftime("%Y-%m-%d"))
+            thu += timedelta(days=7)
+        return keys
 
     def _refresh_meso_history(self):
         if self.selected_char_id is None:
             return
-        cid = self.selected_char_id
-        data = []
-        for i in range(5, -1, -1):
-            total_m = self.actual_current_thursday.year * 12 + self.actual_current_thursday.month - 1 - i
-            year, month = total_m // 12, total_m % 12 + 1
-            mm = self.calculate_monthly_crystal_meso(cid, year, month)
-            label = datetime(year, month, 1).strftime("%b")
-            data.append((label, mm))
-        self.meso_chart.set_data(data)
+        self.meso_chart.set_data([
+            (date(y, m, 1).strftime("%b"), self.calculate_monthly_crystal_meso(self.selected_char_id, y, m))
+            for y, m in self._recent_months()
+        ])
 
     def _count_ring_box_stats(self, char_id=None):
         """Returns (ring_boxes_obtained, converted_to_grindstone) for one character, or all if char_id is None."""
@@ -2716,155 +2605,94 @@ class BossTrackerApp(QMainWindow):
                         grindstones += 1
         return boxes, grindstones
 
-    def _refresh_boss_totals(self):
-        if not hasattr(self, 'boss_totals_table') or self.selected_char_id is None:
-            return
-        cid = self.selected_char_id
-
-        if hasattr(self, 'char_grindstone_label'):
-            boxes, grindstones = self._count_ring_box_stats(cid)
-            pct = f"{grindstones / boxes * 100:.0f}%" if boxes else "—"
-            self.char_grindstone_label.setText(
-                f"Ring Boxes: {boxes}   •   Grindstones: {grindstones} ({pct})")
-
-        if not os.path.exists(BOSS_ASSETS_DIR):
-            self.boss_totals_table.setRowCount(0)
-            return
-
-        boss_counts = {}  # (raw_name, fname_key, diff) -> clear_count
-        boss_items  = {}  # (raw_name, fname_key, diff) -> {item_stem_lower: count}
-
-        for f in sorted(os.listdir(BOSS_ASSETS_DIR)):
-            if not f.lower().endswith('.png'):
-                continue
-            raw_name = os.path.splitext(f)[0]
-            fname_key = raw_name.lower()
-            full_path = os.path.join(BOSS_ASSETS_DIR, f)
-
-            min_week = None
-            for (char_id, wkey), boss_list in self.saved_boss_clears.items():
-                if char_id != cid:
+    def _tally_boss_clears(self, char_ids):
+        """Walk every week from each boss's first stamp through today. Returns
+        (boss_counts, boss_items, rates):
+          boss_counts[(display, key, diff)] = clears
+          boss_items[(display, key, diff)][item_stem] = copies obtained (state 0 only)
+          rates[(item_display, "Display (Diff)")] = (weeks_obtained, clears)"""
+        boss_counts, boss_items, rates = {}, {}, {}
+        for cid in char_ids:
+            first_week = {}
+            for (c, wkey), boss_list in self.saved_boss_clears.items():
+                if c != cid:
                     continue
                 for b in boss_list:
-                    if b["path"] == full_path:
-                        wdt = datetime.strptime(wkey, "%Y-%m-%d").date()
-                        if min_week is None or wdt < min_week:
-                            min_week = wdt
-            if min_week is None:
-                continue
-
-            cursor = min_week
-            while cursor <= self.actual_current_thursday:
-                wkey = cursor.strftime("%Y-%m-%d")
-                state, _ = self.resolve_boss_state_at_week(cid, wkey, full_path)
-                if state and not state.get("is_deleted_marker", False):
-                    diff = state.get("difficulty", "Normal")
-                    key = (raw_name, fname_key, diff)
-                    boss_counts[key] = boss_counts.get(key, 0) + 1
-
-                    # Match items logged in this exact week to this boss/diff's possible drops
-                    possible = {d.lower() for d in BOSS_DROPS.get((fname_key, diff), [])}
-                    if possible:
-                        this_boss_key = f"{fname_key}|{diff}"
-                        for it in self.saved_item_drops.get((cid, wkey), []):
-                            if _item_state(it) != 0:
-                                continue
-                            stem = os.path.splitext(os.path.basename(it["path"]))[0].lower()
-                            if stem in possible:
-                                item_boss_key = it.get("boss_key")
-                                if item_boss_key is None or item_boss_key == this_boss_key:
-                                    bi = boss_items.setdefault(key, {})
-                                    bi[stem] = bi.get(stem, 0) + 1
-
-                cursor += timedelta(days=7)
-
-        self.boss_totals_table.setSortingEnabled(False)
-        self.boss_totals_table.setRowCount(0)
-        for (raw_name, fname_key, diff), total in sorted(boss_counts.items(), key=lambda x: -x[1]):
-            drops = BOSS_DROPS.get((fname_key, diff), [])
-            if drops:
-                ic = boss_items.get((raw_name, fname_key, diff), {})
-                items_str = ",  ".join(f"{item} ×{ic.get(item.lower(), 0)}" for item in drops)
-            else:
-                items_str = "—"
-            row = self.boss_totals_table.rowCount()
-            self.boss_totals_table.insertRow(row)
-            self.boss_totals_table.setItem(row, 0, QTableWidgetItem(f"{raw_name} ({diff})"))
-            self.boss_totals_table.setItem(row, 1, _NumItem(total))
-            self.boss_totals_table.setItem(row, 2, QTableWidgetItem(items_str))
-        self.boss_totals_table.setSortingEnabled(True)
-
-    def _refresh_drop_rates(self):
-        if not hasattr(self, 'drop_rates_table') or self.selected_char_id is None:
-            return
-        cid = self.selected_char_id
-
-        if not os.path.exists(BOSS_ASSETS_DIR):
-            self.drop_rates_table.setRowCount(0)
-            return
-
-        # (item_display, boss_label) -> (obtained, clears)
-        rates = {}
-
-        for f in sorted(os.listdir(BOSS_ASSETS_DIR)):
-            if not f.lower().endswith('.png'):
-                continue
-            raw_name = os.path.splitext(f)[0]
-            fname_key = raw_name.lower()
-            full_path = os.path.join(BOSS_ASSETS_DIR, f)
-
-            min_week = None
-            for (char_id, wkey), boss_list in self.saved_boss_clears.items():
-                if char_id != cid:
+                    if wkey < first_week.get(b["path"], "9"):
+                        first_week[b["path"]] = wkey
+            for path, key, raw in _boss_files():
+                start = first_week.get(path)
+                if start is None:
                     continue
-                for b in boss_list:
-                    if b["path"] == full_path:
-                        wdt = datetime.strptime(wkey, "%Y-%m-%d").date()
-                        if min_week is None or wdt < min_week:
-                            min_week = wdt
-            if min_week is None:
-                continue
-
-            cursor = min_week
-            while cursor <= self.actual_current_thursday:
-                wkey = cursor.strftime("%Y-%m-%d")
-                state, _ = self.resolve_boss_state_at_week(cid, wkey, full_path)
-                if state and not state.get("is_deleted_marker", False):
+                cursor = datetime.strptime(start, "%Y-%m-%d").date()
+                while cursor <= self.actual_current_thursday:
+                    wkey = cursor.strftime("%Y-%m-%d")
+                    cursor += timedelta(days=7)
+                    state, _ = self.resolve_boss_state_at_week(cid, wkey, path)
+                    if not state or state.get("is_deleted_marker", False):
+                        continue
                     diff = state.get("difficulty", "Normal")
-                    drops = BOSS_DROPS.get((fname_key, diff), [])
-                    if drops:
-                        boss_label = f"{raw_name} ({diff})"
-                        possible = {d.lower(): d for d in drops}
-                        week_items = self.saved_item_drops.get((cid, wkey), [])
-                        obtained_this_week = set()
-                        this_boss_key = f"{fname_key}|{diff}"
-                        for it in week_items:
-                            if _item_state(it) == 2:
-                                continue
-                            stem = os.path.splitext(os.path.basename(it["path"]))[0].lower()
-                            if stem in possible:
-                                item_boss_key = it.get("boss_key")
-                                if item_boss_key is None or item_boss_key == this_boss_key:
-                                    obtained_this_week.add(stem)
-                        for stem, display in possible.items():
-                            key = (display, boss_label)
-                            ob, cl = rates.get(key, (0, 0))
-                            rates[key] = (ob + (1 if stem in obtained_this_week else 0), cl + 1)
-                cursor += timedelta(days=7)
+                    bkey = (raw, key, diff)
+                    boss_counts[bkey] = boss_counts.get(bkey, 0) + 1
+                    possible = {d.lower(): d for d in BOSS_DROPS.get((key, diff), [])}
+                    if not possible:
+                        continue
+                    this_boss_key = f"{key}|{diff}"
+                    obtained = set()
+                    for it in self.saved_item_drops.get((cid, wkey), []):
+                        s = _item_state(it)
+                        if s == 2:
+                            continue
+                        stem = os.path.splitext(os.path.basename(it["path"]))[0].lower()
+                        if stem in possible and it.get("boss_key") in (None, this_boss_key):
+                            obtained.add(stem)
+                            if s == 0:
+                                bi = boss_items.setdefault(bkey, {})
+                                bi[stem] = bi.get(stem, 0) + 1
+                    label = f"{raw} ({diff})"
+                    for stem, display in possible.items():
+                        ob, cl = rates.get((display, label), (0, 0))
+                        rates[(display, label)] = (ob + (stem in obtained), cl + 1)
+        return boss_counts, boss_items, rates
 
-        self.drop_rates_table.setSortingEnabled(False)
-        self.drop_rates_table.setRowCount(0)
-        for (item_display, boss_label), (obtained, clears) in sorted(rates.items(), key=lambda x: x[0]):
+    def _fill_boss_totals_table(self, table, boss_counts, boss_items):
+        table.setSortingEnabled(False)
+        table.setRowCount(0)
+        for (raw_name, key, diff), total in sorted(boss_counts.items(), key=lambda x: -x[1]):
+            drops = BOSS_DROPS.get((key, diff), [])
+            ic = boss_items.get((raw_name, key, diff), {})
+            items_str = ",  ".join(f"{item} ×{ic.get(item.lower(), 0)}" for item in drops) if drops else "—"
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, QTableWidgetItem(f"{raw_name} ({diff})"))
+            table.setItem(row, 1, _NumItem(total))
+            table.setItem(row, 2, QTableWidgetItem(items_str))
+        table.setSortingEnabled(True)
+
+    def _fill_drop_rates_table(self, table, rates, cat_cbs):
+        table.setSortingEnabled(False)
+        table.setRowCount(0)
+        for (item_display, boss_label), (obtained, clears) in sorted(rates.items()):
             pct_num = obtained / clears * 100 if clears else -1.0
-            pct = f"{pct_num:.1f}%" if clears else "—"
-            row = self.drop_rates_table.rowCount()
-            self.drop_rates_table.insertRow(row)
-            self.drop_rates_table.setItem(row, 0, QTableWidgetItem(item_display))
-            self.drop_rates_table.setItem(row, 1, QTableWidgetItem(boss_label))
-            self.drop_rates_table.setItem(row, 2, QTableWidgetItem(f"{obtained} / {clears}"))
-            self.drop_rates_table.setItem(row, 3, _NumItem(pct_num, pct))
-        self.drop_rates_table.setSortingEnabled(True)
-        self._apply_drop_filter(self.drop_rates_table, self.char_drop_cat_cbs)
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, QTableWidgetItem(item_display))
+            table.setItem(row, 1, QTableWidgetItem(boss_label))
+            table.setItem(row, 2, QTableWidgetItem(f"{obtained} / {clears}"))
+            table.setItem(row, 3, _NumItem(pct_num, f"{pct_num:.1f}%" if clears else "—"))
+        table.setSortingEnabled(True)
+        self._apply_drop_filter(table, cat_cbs)
+
+    def _refresh_char_clear_tables(self):
+        if self.selected_char_id is None:
+            return
+        cid = self.selected_char_id
+        boxes, grindstones = self._count_ring_box_stats(cid)
+        pct = f"{grindstones / boxes * 100:.0f}%" if boxes else "—"
+        self.char_grindstone_label.setText(f"Ring Boxes: {boxes}   •   Grindstones: {grindstones} ({pct})")
+        boss_counts, boss_items, rates = self._tally_boss_clears([cid])
+        self._fill_boss_totals_table(self.boss_totals_table, boss_counts, boss_items)
+        self._fill_drop_rates_table(self.drop_rates_table, rates, self.char_drop_cat_cbs)
 
     def _make_cat_filter_row(self):
         container = QWidget()
@@ -2931,34 +2759,27 @@ class BossTrackerApp(QMainWindow):
         self.update_overview_calendar()
 
     def _get_monthly_thursday(self, year, month):
-        from datetime import date as _date
-        first = _date(year, month, 1)
-        days_since_thu = (first.weekday() - 3) % 7
-        return first - timedelta(days=days_since_thu)
+        """The Thursday on or before the 1st — the week whose exclusion state governs that month's Black Mage."""
+        first = date(year, month, 1)
+        return first - timedelta(days=(first.weekday() - 3) % 7)
 
-    def calculate_weekly_crystal_meso(self, char_id, week_key, skip_monthly=False, ignore_completion=False):
-        if not ignore_completion and week_key >= self.actual_current_week_key:
-            if f"{char_id}|{week_key}" not in self.char_completed_weeks:
-                return 0
-        week_dt = datetime.strptime(week_key, "%Y-%m-%d").date()
-        if not os.path.exists(BOSS_ASSETS_DIR):
+    def _week_is_locked(self, char_id, week_key):
+        """Current/future weeks only count once the character is marked Done; past weeks always count."""
+        return week_key < self.actual_current_week_key or f"{char_id}|{week_key}" in self.char_completed_weeks
+
+    def calculate_weekly_crystal_meso(self, char_id, week_key, ignore_completion=False):
+        if not ignore_completion and not self._week_is_locked(char_id, week_key):
             return 0
-        meso_values = []
-        for f in sorted(os.listdir(BOSS_ASSETS_DIR)):
-            if not f.lower().endswith('.png'):
-                continue
-            fname = os.path.splitext(f)[0].lower()
-            if fname in MONTHLY_BOSSES:
-                continue
-            full_path = os.path.join(BOSS_ASSETS_DIR, f)
-            state, _ = self.resolve_boss_state_at_week(char_id, week_key, full_path)
-            if state and not state.get("is_deleted_marker", False):
-                difficulty = state["difficulty"]
-                party_size = max(state.get("party_size", 1), 1)
-                meso = BOSS_DIFFICULTY_MAP.get(fname, {}).get(difficulty, 0)
-                meso_values.append(meso // party_size)
-        meso_values.sort(reverse=True)
+        meso_values = sorted(
+            (BOSS_DIFFICULTY_MAP.get(key, {}).get(s["difficulty"], 0) // max(s.get("party_size", 1), 1)
+             for _p, key, _r, s, _i in self._active_bosses(char_id, week_key)),
+            reverse=True)
         return sum(meso_values[:14])
+
+    def calculate_weekly_crystal_count(self, char_id, week_key):
+        if not self._week_is_locked(char_id, week_key):
+            return 0
+        return min(len(self._active_bosses(char_id, week_key)), 14)
 
     def calculate_blackmage_monthly_meso(self, char_id, year, month):
         """Sum Black Mage crystal meso for this character's clear(s) tagged to this calendar month.
@@ -2967,245 +2788,84 @@ class BossTrackerApp(QMainWindow):
         30th and one made on the 1st — even when both land in the same displayed week —
         are correctly split across their own months instead of being conflated.
         """
-        bm_path = os.path.join(BOSS_ASSETS_DIR, "BlackMage.png")
-        if not os.path.exists(bm_path):
-            return 0
         target_month = f"{year:04d}-{month:02d}"
         total = 0
         for (c, wk), stored in self.saved_boss_clears.items():
-            if c != char_id:
-                continue
-            wk_dt = datetime.strptime(wk, "%Y-%m-%d").date()
-            if wk_dt > self.actual_current_thursday:
+            if c != char_id or wk > self.actual_current_week_key:
                 continue
             for b in stored:
-                if (b["path"] == bm_path and not b.get("is_deleted_marker", False)
+                if (b["path"] == _BM_PATH and not b.get("is_deleted_marker", False)
                         and self._blackmage_entry_month(wk, b) == target_month):
-                    difficulty = b["difficulty"]
-                    party_size = max(b.get("party_size", 1), 1)
-                    meso = BOSS_DIFFICULTY_MAP.get("blackmage", {}).get(difficulty, 0)
-                    total += meso // party_size
+                    meso = BOSS_DIFFICULTY_MAP.get("blackmage", {}).get(b["difficulty"], 0)
+                    total += meso // max(b.get("party_size", 1), 1)
         return total
 
     def calculate_monthly_crystal_meso(self, char_id, year, month):
         """Sum weekly crystal meso (excl. Black Mage) for all Thursdays in this month, plus Black Mage for this month."""
-        from datetime import date as _date
-        first = _date(year, month, 1)
-        days_to_thu = (3 - first.weekday()) % 7
-        thu = first + timedelta(days=days_to_thu)
-        total = 0
-        while thu.month == month:
-            if thu <= self.actual_current_thursday:
-                total += self.calculate_weekly_crystal_meso(char_id, thu.strftime("%Y-%m-%d"))
-            thu += timedelta(days=7)
-        total += self.calculate_blackmage_monthly_meso(char_id, year, month)
-        return total
-
-    def calculate_weekly_crystal_count(self, char_id, week_key):
-        if week_key >= self.actual_current_week_key:
-            if f"{char_id}|{week_key}" not in self.char_completed_weeks:
-                return 0
-        week_dt = datetime.strptime(week_key, "%Y-%m-%d").date()
-        if not os.path.exists(BOSS_ASSETS_DIR):
-            return 0
-        count = 0
-        for f in sorted(os.listdir(BOSS_ASSETS_DIR)):
-            if not f.lower().endswith('.png'):
-                continue
-            fname = os.path.splitext(f)[0].lower()
-            if fname in MONTHLY_BOSSES:
-                continue
-            full_path = os.path.join(BOSS_ASSETS_DIR, f)
-            state, _ = self.resolve_boss_state_at_week(char_id, week_key, full_path)
-            if state and not state.get("is_deleted_marker", False):
-                count += 1
-        return min(count, 14)
+        return (sum(self.calculate_weekly_crystal_meso(char_id, wk) for wk in self._month_week_keys(year, month))
+                + self.calculate_blackmage_monthly_meso(char_id, year, month))
 
     def calculate_monthly_crystal_count(self, char_id, year, month):
-        from datetime import date as _date
-        first = _date(year, month, 1)
-        days_to_thu = (3 - first.weekday()) % 7
-        thu = first + timedelta(days=days_to_thu)
-        total = 0
-        while thu.month == month:
-            if thu <= self.actual_current_thursday:
-                total += self.calculate_weekly_crystal_count(char_id, thu.strftime("%Y-%m-%d"))
-            thu += timedelta(days=7)
-        return total
+        return sum(self.calculate_weekly_crystal_count(char_id, wk) for wk in self._month_week_keys(year, month))
+
+    def _included_chars(self, week_key):
+        return [c["id"] for c in self.characters if not self._is_char_excluded_at_week(c["id"], week_key)]
 
     def update_statistics_charts(self):
         if not self._stats_dirty:
             return
         self._stats_dirty = False
         # ── Meso Income tab ─────────────────────────────────────────────
-        from datetime import date as _sdate
         weekly_data = []
         self.stats_weekly_table.setRowCount(0)
         for i in range(7, -1, -1):
             thu = self.actual_current_thursday - timedelta(weeks=i)
             wkey = thu.strftime("%Y-%m-%d")
-            total = sum(
-                self.calculate_weekly_crystal_meso(c["id"], wkey)
-                for c in self.characters
-                if not self._is_char_excluded_at_week(c["id"], wkey)
-            )
-            crystals = sum(
-                self.calculate_weekly_crystal_count(c["id"], wkey)
-                for c in self.characters
-                if not self._is_char_excluded_at_week(c["id"], wkey)
-            )
+            included = self._included_chars(wkey)
+            total = sum(self.calculate_weekly_crystal_meso(cid, wkey) for cid in included)
+            crystals = sum(self.calculate_weekly_crystal_count(cid, wkey) for cid in included)
             label = thu.strftime("%b %d")
             weekly_data.append((label, total))
             row = self.stats_weekly_table.rowCount()
             self.stats_weekly_table.insertRow(row)
             self.stats_weekly_table.setItem(row, 0, QTableWidgetItem(label))
             self.stats_weekly_table.setItem(row, 1, QTableWidgetItem(str(crystals)))
-            self.stats_weekly_table.setItem(row, 2, QTableWidgetItem(self._fmt_meso(total)))
+            self.stats_weekly_table.setItem(row, 2, QTableWidgetItem(_fmt_meso_short(total)))
         self.stats_weekly_chart.set_data(weekly_data)
 
-        monthly_data = []
+        monthly_data, bm_monthly_data = [], []
         self.stats_monthly_table.setRowCount(0)
-        for i in range(5, -1, -1):
-            total_m = self.actual_current_thursday.year * 12 + self.actual_current_thursday.month - 1 - i
-            year, month = total_m // 12, total_m % 12 + 1
-            first_m = _sdate(year, month, 1)
-            days_to_thu = (3 - first_m.weekday()) % 7
-            thu_iter = first_m + timedelta(days=days_to_thu)
-            total = 0
-            crystals = 0
-            while thu_iter.month == month:
-                if thu_iter <= self.actual_current_thursday:
-                    wkey_m = thu_iter.strftime("%Y-%m-%d")
-                    for c in self.characters:
-                        if not self._is_char_excluded_at_week(c["id"], wkey_m):
-                            total += self.calculate_weekly_crystal_meso(c["id"], wkey_m)
-                            crystals += self.calculate_weekly_crystal_count(c["id"], wkey_m)
-                thu_iter += timedelta(days=7)
+        self.stats_bm_monthly_table.setRowCount(0)
+        for year, month in self._recent_months():
+            total = crystals = 0
+            for wkey_m in self._month_week_keys(year, month):
+                for cid in self._included_chars(wkey_m):
+                    total += self.calculate_weekly_crystal_meso(cid, wkey_m)
+                    crystals += self.calculate_weekly_crystal_count(cid, wkey_m)
             # Black Mage counts in the monthly total; use the monthly week's Thursday for exclusion check
-            bm_thu = first_m - timedelta(days=(first_m.weekday() - 3) % 7)
-            bm_wkey = bm_thu.strftime("%Y-%m-%d")
-            for c in self.characters:
-                if not self._is_char_excluded_at_week(c["id"], bm_wkey):
-                    total += self.calculate_blackmage_monthly_meso(c["id"], year, month)
-            monthly_data.append((datetime(year, month, 1).strftime("%b"), total))
+            bm_wkey = self._get_monthly_thursday(year, month).strftime("%Y-%m-%d")
+            bm_total = sum(self.calculate_blackmage_monthly_meso(cid, year, month)
+                           for cid in self._included_chars(bm_wkey))
+            total += bm_total
+            short, long = date(year, month, 1).strftime("%b"), date(year, month, 1).strftime("%b %Y")
+            monthly_data.append((short, total))
+            bm_monthly_data.append((short, bm_total))
             row = self.stats_monthly_table.rowCount()
             self.stats_monthly_table.insertRow(row)
-            self.stats_monthly_table.setItem(row, 0, QTableWidgetItem(datetime(year, month, 1).strftime("%b %Y")))
+            self.stats_monthly_table.setItem(row, 0, QTableWidgetItem(long))
             self.stats_monthly_table.setItem(row, 1, QTableWidgetItem(str(crystals)))
-            self.stats_monthly_table.setItem(row, 2, QTableWidgetItem(self._fmt_meso(total)))
-        self.stats_monthly_chart.set_data(monthly_data)
-
-        bm_monthly_data = []
-        self.stats_bm_monthly_table.setRowCount(0)
-        for i in range(5, -1, -1):
-            total_m = self.actual_current_thursday.year * 12 + self.actual_current_thursday.month - 1 - i
-            year, month = total_m // 12, total_m % 12 + 1
-            first_m = _sdate(year, month, 1)
-            bm_thu = first_m - timedelta(days=(first_m.weekday() - 3) % 7)
-            bm_wkey = bm_thu.strftime("%Y-%m-%d")
-            total = sum(
-                self.calculate_blackmage_monthly_meso(c["id"], year, month)
-                for c in self.characters
-                if not self._is_char_excluded_at_week(c["id"], bm_wkey)
-            )
-            bm_monthly_data.append((datetime(year, month, 1).strftime("%b"), total))
+            self.stats_monthly_table.setItem(row, 2, QTableWidgetItem(_fmt_meso_short(total)))
             row = self.stats_bm_monthly_table.rowCount()
             self.stats_bm_monthly_table.insertRow(row)
-            self.stats_bm_monthly_table.setItem(row, 0, QTableWidgetItem(datetime(year, month, 1).strftime("%b %Y")))
-            self.stats_bm_monthly_table.setItem(row, 1, QTableWidgetItem(self._fmt_meso(total)))
+            self.stats_bm_monthly_table.setItem(row, 0, QTableWidgetItem(long))
+            self.stats_bm_monthly_table.setItem(row, 1, QTableWidgetItem(_fmt_meso_short(bm_total)))
+        self.stats_monthly_chart.set_data(monthly_data)
         self.stats_bm_monthly_chart.set_data(bm_monthly_data)
 
         # ── Boss Clears tab ─────────────────────────────────────────────
-        if not os.path.exists(BOSS_ASSETS_DIR):
-            return
-
-        boss_counts = {}   # (raw_name, fname_key, diff) -> clear_count
-        boss_items  = {}   # (raw_name, fname_key, diff) -> {item_stem_lower: count}
-        rates       = {}   # (item_display, boss_label) -> (obtained, clears)
-
-        for char in self.characters:
-            cid = char["id"]
-            for f in sorted(os.listdir(BOSS_ASSETS_DIR)):
-                if not f.lower().endswith('.png'):
-                    continue
-                raw_name = os.path.splitext(f)[0]
-                fname_key = raw_name.lower()
-                full_path = os.path.join(BOSS_ASSETS_DIR, f)
-
-                min_week = None
-                for (char_id, wkey), boss_list in self.saved_boss_clears.items():
-                    if char_id != cid:
-                        continue
-                    for b in boss_list:
-                        if b["path"] == full_path:
-                            wdt = datetime.strptime(wkey, "%Y-%m-%d").date()
-                            if min_week is None or wdt < min_week:
-                                min_week = wdt
-                if min_week is None:
-                    continue
-
-                cursor = min_week
-                while cursor <= self.actual_current_thursday:
-                    wkey = cursor.strftime("%Y-%m-%d")
-                    state, _ = self.resolve_boss_state_at_week(cid, wkey, full_path)
-                    if state and not state.get("is_deleted_marker", False):
-                        diff = state.get("difficulty", "Normal")
-                        key = (raw_name, fname_key, diff)
-                        boss_counts[key] = boss_counts.get(key, 0) + 1
-
-                        possible = {d.lower(): d for d in BOSS_DROPS.get((fname_key, diff), [])}
-                        if possible:
-                            week_items = self.saved_item_drops.get((cid, wkey), [])
-                            obtained_this_week = set()
-                            this_boss_key = f"{fname_key}|{diff}"
-                            for it in week_items:
-                                s = _item_state(it)
-                                if s == 2:
-                                    continue
-                                stem = os.path.splitext(os.path.basename(it["path"]))[0].lower()
-                                if stem in possible:
-                                    item_boss_key = it.get("boss_key")
-                                    if item_boss_key is None or item_boss_key == this_boss_key:
-                                        obtained_this_week.add(stem)
-                                        if s == 0:
-                                            bi = boss_items.setdefault(key, {})
-                                            bi[stem] = bi.get(stem, 0) + 1
-                            boss_label = f"{raw_name} ({diff})"
-                            for stem, display in possible.items():
-                                rk = (display, boss_label)
-                                ob, cl = rates.get(rk, (0, 0))
-                                rates[rk] = (ob + (1 if stem in obtained_this_week else 0), cl + 1)
-                    cursor += timedelta(days=7)
-
-        self.stats_boss_totals_table.setSortingEnabled(False)
-        self.stats_boss_totals_table.setRowCount(0)
-        for (raw_name, fname_key, diff), total in sorted(boss_counts.items(), key=lambda x: -x[1]):
-            drops = BOSS_DROPS.get((fname_key, diff), [])
-            if drops:
-                ic = boss_items.get((raw_name, fname_key, diff), {})
-                items_str = ",  ".join(f"{item} ×{ic.get(item.lower(), 0)}" for item in drops)
-            else:
-                items_str = "—"
-            row = self.stats_boss_totals_table.rowCount()
-            self.stats_boss_totals_table.insertRow(row)
-            self.stats_boss_totals_table.setItem(row, 0, QTableWidgetItem(f"{raw_name} ({diff})"))
-            self.stats_boss_totals_table.setItem(row, 1, _NumItem(total))
-            self.stats_boss_totals_table.setItem(row, 2, QTableWidgetItem(items_str))
-        self.stats_boss_totals_table.setSortingEnabled(True)
-
-        self.stats_drop_rates_table.setSortingEnabled(False)
-        self.stats_drop_rates_table.setRowCount(0)
-        for (item_display, boss_label), (obtained, clears) in sorted(rates.items()):
-            pct_num = obtained / clears * 100 if clears else -1.0
-            pct = f"{pct_num:.1f}%" if clears else "—"
-            row = self.stats_drop_rates_table.rowCount()
-            self.stats_drop_rates_table.insertRow(row)
-            self.stats_drop_rates_table.setItem(row, 0, QTableWidgetItem(item_display))
-            self.stats_drop_rates_table.setItem(row, 1, QTableWidgetItem(boss_label))
-            self.stats_drop_rates_table.setItem(row, 2, QTableWidgetItem(f"{obtained} / {clears}"))
-            self.stats_drop_rates_table.setItem(row, 3, _NumItem(pct_num, pct))
-        self.stats_drop_rates_table.setSortingEnabled(True)
-        self._apply_drop_filter(self.stats_drop_rates_table, self.stats_drop_cat_cbs)
+        boss_counts, boss_items, rates = self._tally_boss_clears([c["id"] for c in self.characters])
+        self._fill_boss_totals_table(self.stats_boss_totals_table, boss_counts, boss_items)
+        self._fill_drop_rates_table(self.stats_drop_rates_table, rates, self.stats_drop_cat_cbs)
 
         self.stats_grindstone_table.setRowCount(0)
         boxes_total = 0
@@ -3302,7 +2962,7 @@ class BossTrackerApp(QMainWindow):
             week_meso = sum(self.calculate_weekly_crystal_meso(c["id"], self.actual_current_week_key) for c in done_included)
             bm_week_meso = sum(self.calculate_weekly_blackmage_meso(c["id"], self.actual_current_week_key) for c in included_chars)
             self.completed_summary_label.setText(
-                f"Completed this week: {len(done_included)}/{len(included_chars)} characters  •  Meso: {self._fmt_meso(week_meso + bm_week_meso)}")
+                f"Completed this week: {len(done_included)}/{len(included_chars)} characters  •  Meso: {_fmt_meso_short(week_meso + bm_week_meso)}")
 
             week_crystal_count = sum(self.calculate_weekly_crystal_count(c["id"], self.actual_current_week_key) for c in done_included)
             bm_week_count = sum(len(self._blackmage_entries_for_week(c["id"], self.actual_current_week_key)) for c in included_chars)
@@ -3312,7 +2972,7 @@ class BossTrackerApp(QMainWindow):
             if excluded_chars:
                 excluded_meso = sum(self.calculate_weekly_crystal_meso(c["id"], self.actual_current_week_key) for c in done_excluded)
                 self.completed_summary_excluded_label.setText(
-                    f"CW Completed this week: {len(done_excluded)}/{len(excluded_chars)} characters  •  Meso: {self._fmt_meso(excluded_meso)}")
+                    f"CW Completed this week: {len(done_excluded)}/{len(excluded_chars)} characters  •  Meso: {_fmt_meso_short(excluded_meso)}")
                 self.completed_summary_excluded_label.setVisible(True)
             else:
                 self.completed_summary_excluded_label.setVisible(False)
@@ -3363,26 +3023,16 @@ class BossTrackerApp(QMainWindow):
         char_match = next((c for c in self.characters if c["id"] == self.selected_char_id), None)
         self.boss_grid.addWidget(QLabel(f"➔ {char_match['name']}\nBoss Runs"), 1, 0)
 
+        boss_count_by_week = {}
         for col, w in enumerate(weeks, start=1):
             cell = DynamicCalendarCell(char_match["id"], w["key"], w["is_current"], self.drop_boss_callback,
                                        self.toggle_boss_difficulty, self.delete_boss_callback,
-                                       None, self.handle_party_size_click,
-                                       wrap_cols=4)
+                                       party_click_cb=self.handle_party_size_click, wrap_cols=4)
 
-            idx = 0
-            if os.path.exists(BOSS_ASSETS_DIR):
-                for f in sorted(os.listdir(BOSS_ASSETS_DIR)):
-                    if f.lower().endswith('.png'):
-                        fname = os.path.splitext(f)[0].lower()
-                        if fname in MONTHLY_BOSSES:
-                            continue
-                        full_path = os.path.join(BOSS_ASSETS_DIR, f)
-                        state, is_inherited = self.resolve_boss_state_at_week(char_match["id"], w["key"], full_path)
-
-                        if state and not state.get("is_deleted_marker", False):
-                            cell.add_icon(idx, full_path, False, state["difficulty"], state.get("party_size", 1),
-                                          is_inherited)
-                            idx += 1
+            active = self._active_bosses(char_match["id"], w["key"])
+            boss_count_by_week[w["key"]] = len(active)
+            for idx, (path, _k, _r, state, is_inherited) in enumerate(active):
+                cell.add_icon(idx, path, False, state["difficulty"], state.get("party_size", 1), is_inherited)
 
             # Black Mage is rendered separately (not through the generic single-entry resolver)
             # since the same week can legitimately hold two clears — one for each of two
@@ -3401,14 +3051,12 @@ class BossTrackerApp(QMainWindow):
         meso_row_lbl.setStyleSheet("color: #f0c040; font-size: 10px; font-weight: bold;")
         self.boss_grid.addWidget(meso_row_lbl, 2, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         for col, w in enumerate(weeks, start=1):
-            is_locked_in = w["key"] < self.actual_current_week_key or \
-                f"{self.selected_char_id}|{w['key']}" in self.char_completed_weeks
             wm = self.calculate_weekly_crystal_meso(self.selected_char_id, w["key"], ignore_completion=True)
-            if is_locked_in:
-                wm_lbl = QLabel(self._fmt_meso(wm))
+            if self._week_is_locked(self.selected_char_id, w["key"]):
+                wm_lbl = QLabel(_fmt_meso_short(wm))
                 wm_lbl.setStyleSheet("color: #f0c040; font-size: 12px; font-weight: bold; padding: 4px;")
             else:
-                wm_lbl = QLabel(f"Estimated:\n{self._fmt_meso(wm)}")
+                wm_lbl = QLabel(f"Estimated:\n{_fmt_meso_short(wm)}")
                 wm_lbl.setStyleSheet("color: #a08030; font-size: 11px; font-style: italic; font-weight: bold; padding: 4px;")
             wm_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.boss_grid.addWidget(wm_lbl, 2, col)
@@ -3417,19 +3065,7 @@ class BossTrackerApp(QMainWindow):
         count_row_lbl.setStyleSheet("color: #aaaaaa; font-size: 10px; font-weight: bold;")
         self.boss_grid.addWidget(count_row_lbl, 3, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         for col, w in enumerate(weeks, start=1):
-            week_dt = datetime.strptime(w["key"], "%Y-%m-%d").date()
-            boss_count = 0
-            if os.path.exists(BOSS_ASSETS_DIR):
-                for f in sorted(os.listdir(BOSS_ASSETS_DIR)):
-                    if not f.lower().endswith('.png'):
-                        continue
-                    fname = os.path.splitext(f)[0].lower()
-                    if fname in MONTHLY_BOSSES:
-                        continue
-                    full_path = os.path.join(BOSS_ASSETS_DIR, f)
-                    state, _ = self.resolve_boss_state_at_week(self.selected_char_id, w["key"], full_path)
-                    if state and not state.get("is_deleted_marker", False):
-                        boss_count += 1
+            boss_count = boss_count_by_week[w["key"]]
             color = "#2ecc71" if boss_count <= 14 else "#ff3333"
             count_lbl = QLabel(f"{boss_count}/14")
             count_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3469,10 +3105,9 @@ class BossTrackerApp(QMainWindow):
             self.actual_current_thursday.year,
             self.actual_current_thursday.month,
         )
-        self.lbl_monthly_meso.setText(self._fmt_meso(monthly))
+        self.lbl_monthly_meso.setText(_fmt_meso_short(monthly))
         self._refresh_meso_history()
-        self._refresh_boss_totals()
-        self._refresh_drop_rates()
+        self._refresh_char_clear_tables()
         self._refresh_char_tasks_tab()
         self._refresh_char_item_results_tab()
 
@@ -3480,30 +3115,20 @@ class BossTrackerApp(QMainWindow):
         while self.boss_shelf_layout.count():
             widget = self.boss_shelf_layout.takeAt(0).widget()
             if widget: widget.deleteLater()
-        if not os.path.exists(BOSS_ASSETS_DIR): return
 
-        boss_files = sorted(f for f in os.listdir(BOSS_ASSETS_DIR)
-                            if f.lower().endswith('.png') and os.path.splitext(f)[0].lower() not in MONTHLY_BOSSES)
-        higher_value_files = [f for f in boss_files if _boss_worth(os.path.splitext(f)[0].lower()) >= LOWER_PRICE_THRESHOLD]
-        lower_value_files = [f for f in boss_files if _boss_worth(os.path.splitext(f)[0].lower()) < LOWER_PRICE_THRESHOLD]
+        boss_files = [b for b in _boss_files() if b[1] not in MONTHLY_BOSSES]
+        higher_value_files = [b for b in boss_files if _boss_worth(b[1]) >= LOWER_PRICE_THRESHOLD]
+        lower_value_files = [b for b in boss_files if _boss_worth(b[1]) < LOWER_PRICE_THRESHOLD]
 
         row_idx = 0
 
-        def add_boss_widget(file, row, col):
-            full_path = os.path.join(BOSS_ASSETS_DIR, file)
-            assigned_date_string = None
-            for w in self.calculate_visible_weeks_data():
-                state, _ = self.resolve_boss_state_at_week(self.selected_char_id, w["key"], full_path)
-                if state and not state.get("is_deleted_marker", False):
-                    assigned_date_string = f"Active Timeline"
-                    break
-            boss_widget = DraggableAssetItem(os.path.splitext(file)[0], full_path, assigned_date_string,
-                                             self.handle_panel_boss_right_click, show_price=True)
-            self.boss_shelf_layout.addWidget(boss_widget, row, col)
+        def add_boss_widget(boss, row, col):
+            path, _key, raw = boss
+            self.boss_shelf_layout.addWidget(DraggableAssetItem(raw, path, show_price=True), row, col)
 
         col_idx = 0
-        for file in higher_value_files:
-            add_boss_widget(file, row_idx, col_idx)
+        for boss in higher_value_files:
+            add_boss_widget(boss, row_idx, col_idx)
             col_idx += 1
             if col_idx >= 3: col_idx, row_idx = 0, row_idx + 1
 
@@ -3514,30 +3139,19 @@ class BossTrackerApp(QMainWindow):
             self.boss_shelf_layout.addWidget(sep_lbl, row_idx, 0, 1, 3)
             row_idx += 1
             col_idx = 0
-            for file in lower_value_files:
-                add_boss_widget(file, row_idx, col_idx)
+            for boss in lower_value_files:
+                add_boss_widget(boss, row_idx, col_idx)
                 col_idx += 1
                 if col_idx >= 3: col_idx, row_idx = 0, row_idx + 1
-
-    def toggle_inline_calendar(self):
-        self.inline_calendar_drawer.setVisible(not self.inline_calendar_drawer.isVisible())
 
     def _find_matching_bosses_for_item(self, cid, wkey, path):
         """Bosses on the calendar this week whose current difficulty drops this item."""
         item_stem = os.path.splitext(os.path.basename(path))[0].lower()
         matching_bosses = []
-        if os.path.exists(BOSS_ASSETS_DIR):
-            for f in sorted(os.listdir(BOSS_ASSETS_DIR)):
-                if not f.lower().endswith('.png'):
-                    continue
-                fname_key = os.path.splitext(f)[0].lower()
-                full_path = os.path.join(BOSS_ASSETS_DIR, f)
-                state, _ = self.resolve_boss_state_at_week(cid, wkey, full_path)
-                if state and not state.get("is_deleted_marker", False):
-                    diff = state["difficulty"]
-                    if item_stem in [d.lower() for d in BOSS_DROPS.get((fname_key, diff), [])]:
-                        raw_name = os.path.splitext(f)[0]
-                        matching_bosses.append((fname_key, diff, f"{raw_name} ({diff})"))
+        for _p, key, raw, state, _i in self._active_bosses(cid, wkey, include_monthly=True):
+            diff = state["difficulty"]
+            if item_stem in (d.lower() for d in BOSS_DROPS.get((key, diff), [])):
+                matching_bosses.append((key, diff, f"{raw} ({diff})"))
         return matching_bosses
 
     def _exclude_claimed_bosses(self, cid, wkey, item_stem, candidates):
@@ -3635,25 +3249,42 @@ class BossTrackerApp(QMainWindow):
             self.update_overview_calendar()
 
     # --- BOSS ENGINE CONSTRUCTS ---
-    def drop_boss_callback(self, cid, wkey, path):
+    def _upsert_stamp(self, cid, wkey, path, base=None, **updates):
+        """Apply `updates` to this week's explicit stamp for `path`, creating it (from `base` over
+        the defaults) if there isn't one yet."""
         explicit_list = self.saved_boss_clears.setdefault((cid, wkey), [])
-        for b in list(explicit_list):
-            if b["path"] == path: explicit_list.remove(b)
+        match = next((b for b in explicit_list if b["path"] == path), None)
+        if match is None:
+            match = {"path": path, "difficulty": "Normal", "party_size": 1, "is_deleted_marker": False, **(base or {})}
+            explicit_list.append(match)
+        match.update(updates)
 
+    def _forward_run(self, cid, wkey, path, state):
+        """This week plus each following week (through today) where `path` still resolves to the
+        same difficulty — the contiguous run a difficulty/party/delete edit applies to."""
+        run = [(wkey, state)]
+        cursor = datetime.strptime(wkey, "%Y-%m-%d").date() + timedelta(days=7)
+        while cursor <= self.actual_current_thursday:
+            k = cursor.strftime("%Y-%m-%d")
+            ws, _ = self.resolve_boss_state_at_week(cid, k, path)
+            if not ws or ws.get("is_deleted_marker", False) or ws["difficulty"] != state["difficulty"]:
+                break
+            run.append((k, ws))
+            cursor += timedelta(days=7)
+        return run
+
+    def drop_boss_callback(self, cid, wkey, path):
         filename_clean = os.path.splitext(os.path.basename(path))[0].lower()
-        initial_tier = _default_difficulty(filename_clean)
-        explicit_list.append({"path": path, "difficulty": initial_tier, "party_size": 1, "is_deleted_marker": False})
+        self._upsert_stamp(cid, wkey, path, difficulty=_default_difficulty(filename_clean),
+                           party_size=1, is_deleted_marker=False)
 
         # Clear cascaded deletion markers in all subsequent weeks so inheritance flows forward
-        drop_dt = datetime.strptime(wkey, "%Y-%m-%d").date()
-        cursor = drop_dt + timedelta(days=7)
+        cursor = datetime.strptime(wkey, "%Y-%m-%d").date() + timedelta(days=7)
         while cursor <= self.actual_current_thursday:
             cursor_wkey = cursor.strftime("%Y-%m-%d")
             cursor_list = self.saved_boss_clears.get((cid, cursor_wkey))
             if cursor_list:
-                for b in list(cursor_list):
-                    if b["path"] == path and b.get("is_deleted_marker", False):
-                        cursor_list.remove(b)
+                cursor_list[:] = [b for b in cursor_list if not (b["path"] == path and b.get("is_deleted_marker", False))]
                 if not cursor_list:
                     del self.saved_boss_clears[(cid, cursor_wkey)]
             cursor += timedelta(days=7)
@@ -3669,41 +3300,33 @@ class BossTrackerApp(QMainWindow):
         can legitimately hold one clear for each of two different months. Legacy entries
         without a tag fall back to their storage week's own Thursday.
         """
-        if entry.get("month"):
-            return entry["month"]
-        wk_dt = datetime.strptime(wkey, "%Y-%m-%d").date()
-        return wk_dt.strftime("%Y-%m")
+        return entry.get("month") or wkey[:7]
 
     def _last_blackmage_record(self, cid):
         """Most recent past Black Mage clear for this character, across any week."""
-        bm_path = os.path.join(BOSS_ASSETS_DIR, "BlackMage.png")
-        last_record, last_date = None, None
+        last_record, last_wk = None, ""
         for (c, wk), stored in self.saved_boss_clears.items():
-            if c != cid:
+            if c != cid or wk <= last_wk:
                 continue
             for b in stored:
-                if b["path"] == bm_path and not b.get("is_deleted_marker", False):
-                    wk_dt = datetime.strptime(wk, "%Y-%m-%d").date()
-                    if last_date is None or wk_dt > last_date:
-                        last_date, last_record = wk_dt, b
+                if b["path"] == _BM_PATH and not b.get("is_deleted_marker", False):
+                    last_wk, last_record = wk, b
         return last_record
 
     def _find_blackmage_entry_for_month(self, cid, target_month):
         """Returns (wkey, entry) for this character's clear tagged with target_month, or (None, None)."""
-        bm_path = os.path.join(BOSS_ASSETS_DIR, "BlackMage.png")
         for (c, wk), stored in self.saved_boss_clears.items():
             if c != cid:
                 continue
             for b in stored:
-                if b["path"] == bm_path and not b.get("is_deleted_marker", False):
+                if b["path"] == _BM_PATH and not b.get("is_deleted_marker", False):
                     if self._blackmage_entry_month(wk, b) == target_month:
                         return wk, b
         return None, None
 
     def _blackmage_entries_for_week(self, cid, wkey):
-        bm_path = os.path.join(BOSS_ASSETS_DIR, "BlackMage.png")
         return [b for b in self.saved_boss_clears.get((cid, wkey), [])
-                if b["path"] == bm_path and not b.get("is_deleted_marker", False)]
+                if b["path"] == _BM_PATH and not b.get("is_deleted_marker", False)]
 
     def calculate_weekly_blackmage_meso(self, char_id, week_key):
         """Black Mage crystal meso from clear(s) actually recorded in this week."""
@@ -3724,8 +3347,7 @@ class BossTrackerApp(QMainWindow):
         toggled off from wherever it actually is, since that can be a different week
         than "today" if the month hasn't rolled over since it was checked.
         """
-        bm_path = os.path.join(BOSS_ASSETS_DIR, "BlackMage.png")
-        if not os.path.exists(bm_path):
+        if not os.path.exists(_BM_PATH):
             return
         current_month = datetime.now().strftime("%Y-%m")
         found_wkey, found_entry = self._find_blackmage_entry_for_month(cid, current_month)
@@ -3756,7 +3378,7 @@ class BossTrackerApp(QMainWindow):
                 return
 
         explicit_list = self.saved_boss_clears.setdefault((cid, wkey), [])
-        explicit_list.append({"path": bm_path, "difficulty": difficulty, "party_size": party_size,
+        explicit_list.append({"path": _BM_PATH, "difficulty": difficulty, "party_size": party_size,
                               "is_deleted_marker": False, "month": current_month})
         self.save_data()
         self.update_boss_schedule_calendar()
@@ -3827,165 +3449,58 @@ class BossTrackerApp(QMainWindow):
         self.update_boss_schedule_calendar()
         self.update_overview_calendar()
 
+    def _clicked_boss(self, cid, wkey, idx):
+        """(path, key, state) for the idx-th visible (non-monthly) boss icon in a week cell, or None."""
+        active = self._active_bosses(cid, wkey)
+        if not (0 <= idx < len(active)):
+            return None
+        path, key, _raw, state, _inh = active[idx]
+        return path, key, state
+
     def toggle_boss_difficulty(self, cid, wkey, idx):
-        visible_bosses = []
-        if os.path.exists(BOSS_ASSETS_DIR):
-            for f in sorted(os.listdir(BOSS_ASSETS_DIR)):
-                if f.lower().endswith('.png'):
-                    fname = os.path.splitext(f)[0].lower()
-                    if fname in MONTHLY_BOSSES:
-                        continue
-                    fp = os.path.join(BOSS_ASSETS_DIR, f)
-                    state, _ = self.resolve_boss_state_at_week(cid, wkey, fp)
-                    if state and not state.get("is_deleted_marker", False): visible_bosses.append((fp, state))
+        hit = self._clicked_boss(cid, wkey, idx)
+        if hit is None:
+            return
+        target_path, key, current_state = hit
+        allowed_tiers = list(BOSS_DIFFICULTY_MAP.get(key, {"Normal": 0, "Hard": 0}).keys())
+        new_difficulty = allowed_tiers[(allowed_tiers.index(current_state["difficulty"]) + 1) % len(allowed_tiers)]
 
-        if not (0 <= idx < len(visible_bosses)): return
-        target_path, current_state = visible_bosses[idx]
-
-        filename_clean = os.path.splitext(os.path.basename(target_path))[0].lower()
-        allowed_tiers = list(BOSS_DIFFICULTY_MAP.get(filename_clean, {"Normal": 0, "Hard": 0}).keys())
-        original_difficulty = current_state["difficulty"]
-        new_difficulty = allowed_tiers[(allowed_tiers.index(original_difficulty) + 1) % len(allowed_tiers)]
-
-        start_dt = datetime.strptime(wkey, "%Y-%m-%d").date()
-        weeks_to_update = [(wkey, current_state)]
-        cursor = start_dt + timedelta(days=7)
-        while cursor <= self.actual_current_thursday:
-            apply_wkey = cursor.strftime("%Y-%m-%d")
-            ws, _ = self.resolve_boss_state_at_week(cid, apply_wkey, target_path)
-            if ws and not ws.get("is_deleted_marker", False) and ws["difficulty"] == original_difficulty:
-                weeks_to_update.append((apply_wkey, ws))
-            else:
-                break
-            cursor += timedelta(days=7)
-
-        for apply_wkey, ws in weeks_to_update:
-            explicit_list = self.saved_boss_clears.setdefault((cid, apply_wkey), [])
-            match = next((b for b in explicit_list if b["path"] == target_path), None)
-            if match:
-                match["difficulty"] = new_difficulty
-                match["is_deleted_marker"] = False
-            else:
-                explicit_list.append({"path": target_path, "difficulty": new_difficulty,
-                                      "party_size": ws.get("party_size", 1), "is_deleted_marker": False})
-
+        for apply_wkey, ws in self._forward_run(cid, wkey, target_path, current_state):
+            self._upsert_stamp(cid, apply_wkey, target_path, {"party_size": ws.get("party_size", 1)},
+                               difficulty=new_difficulty, is_deleted_marker=False)
         self.save_data()
         self.update_boss_schedule_calendar()
 
     def handle_party_size_click(self, cid, wkey, idx):
-        visible_bosses = []
-        if os.path.exists(BOSS_ASSETS_DIR):
-            for f in sorted(os.listdir(BOSS_ASSETS_DIR)):
-                if f.lower().endswith('.png'):
-                    fname_f = os.path.splitext(f)[0].lower()
-                    if fname_f in MONTHLY_BOSSES:
-                        continue
-                    fp = os.path.join(BOSS_ASSETS_DIR, f)
-                    state, _ = self.resolve_boss_state_at_week(cid, wkey, fp)
-                    if state and not state.get("is_deleted_marker", False): visible_bosses.append((fp, state))
-
-        if not (0 <= idx < len(visible_bosses)): return
-        target_path, current_state = visible_bosses[idx]
-
-        filename_clean = os.path.splitext(os.path.basename(target_path))[0].lower()
-        max_allowed = 3 if filename_clean in ["limbo", "baldrix"] else 6
+        hit = self._clicked_boss(cid, wkey, idx)
+        if hit is None:
+            return
+        target_path, key, current_state = hit
+        max_allowed = 3 if key in ("limbo", "baldrix") else 6
         new_size, ok = QInputDialog.getInt(self, "Party Setup", "Enter runners amount:",
                                            value=current_state.get("party_size", 1), min=1, max=max_allowed)
         if not ok:
             return
 
-        original_difficulty = current_state["difficulty"]
-
-        start_dt = datetime.strptime(wkey, "%Y-%m-%d").date()
-        weeks_to_update = [(wkey, current_state)]
-        cursor = start_dt + timedelta(days=7)
-        while cursor <= self.actual_current_thursday:
-            apply_wkey = cursor.strftime("%Y-%m-%d")
-            ws, _ = self.resolve_boss_state_at_week(cid, apply_wkey, target_path)
-            if ws and not ws.get("is_deleted_marker", False) and ws["difficulty"] == original_difficulty:
-                weeks_to_update.append((apply_wkey, ws))
-            else:
-                break
-            cursor += timedelta(days=7)
-
-        for apply_wkey, ws in weeks_to_update:
-            explicit_list = self.saved_boss_clears.setdefault((cid, apply_wkey), [])
-            match = next((b for b in explicit_list if b["path"] == target_path), None)
-            if match:
-                match["party_size"] = new_size
-                match["is_deleted_marker"] = False
-            else:
-                explicit_list.append({"path": target_path, "difficulty": ws.get("difficulty", "Normal"),
-                                      "party_size": new_size, "is_deleted_marker": False})
-
+        for apply_wkey, ws in self._forward_run(cid, wkey, target_path, current_state):
+            self._upsert_stamp(cid, apply_wkey, target_path, {"difficulty": ws.get("difficulty", "Normal")},
+                               party_size=new_size, is_deleted_marker=False)
         self.save_data()
         self.update_boss_schedule_calendar()
 
     def delete_boss_callback(self, cid, wkey, idx):
-        visible_bosses = []
-        if os.path.exists(BOSS_ASSETS_DIR):
-            for f in sorted(os.listdir(BOSS_ASSETS_DIR)):
-                if f.lower().endswith('.png'):
-                    fname_d = os.path.splitext(f)[0].lower()
-                    if fname_d in MONTHLY_BOSSES:
-                        continue
-                    fp = os.path.join(BOSS_ASSETS_DIR, f)
-                    state, _ = self.resolve_boss_state_at_week(cid, wkey, fp)
-                    if state and not state.get("is_deleted_marker", False): visible_bosses.append((fp, state))
-
-        if not (0 <= idx < len(visible_bosses)): return
-        target_path, clicked_state = visible_bosses[idx]
-        original_difficulty = clicked_state["difficulty"]
-
-        start_dt = datetime.strptime(wkey, "%Y-%m-%d").date()
-        weeks_to_delete = [wkey]
-        cursor = start_dt + timedelta(days=7)
-        while cursor <= self.actual_current_thursday:
-            apply_wkey = cursor.strftime("%Y-%m-%d")
-            ws, _ = self.resolve_boss_state_at_week(cid, apply_wkey, target_path)
-            if ws and not ws.get("is_deleted_marker", False) and ws["difficulty"] == original_difficulty:
-                weeks_to_delete.append(apply_wkey)
-            else:
-                break
-            cursor += timedelta(days=7)
-
-        for apply_wkey in weeks_to_delete:
-            explicit_list = self.saved_boss_clears.setdefault((cid, apply_wkey), [])
-            match = next((b for b in explicit_list if b["path"] == target_path), None)
-            if match:
-                match["is_deleted_marker"] = True
-            else:
-                explicit_list.append(
-                    {"path": target_path, "difficulty": "Normal", "party_size": 1, "is_deleted_marker": True})
-
+        hit = self._clicked_boss(cid, wkey, idx)
+        if hit is None:
+            return
+        target_path, _key, clicked_state = hit
+        for apply_wkey, _ws in self._forward_run(cid, wkey, target_path, clicked_state):
+            self._upsert_stamp(cid, apply_wkey, target_path, is_deleted_marker=True)
         self.save_data()
         self.update_boss_schedule_calendar()
-
-    def handle_clear_all_cell_bosses(self, cid, wkey):
-        if os.path.exists(BOSS_ASSETS_DIR):
-            for f in os.listdir(BOSS_ASSETS_DIR):
-                if f.lower().endswith('.png'):
-                    fp = os.path.join(BOSS_ASSETS_DIR, f)
-                    explicit_list = self.saved_boss_clears.setdefault((cid, wkey), [])
-                    match = next((b for b in explicit_list if b["path"] == fp), None)
-                    if match:
-                        match["is_deleted_marker"] = True
-                    else:
-                        explicit_list.append(
-                            {"path": fp, "difficulty": "Normal", "party_size": 1, "is_deleted_marker": True})
-        self.save_data()
-        self.update_boss_schedule_calendar()
-
-    def handle_panel_boss_right_click(self, target_image_path):
-        visible_weeks = [w["key"] for w in self.calculate_visible_weeks_data()]
-        if visible_weeks:
-            self.delete_boss_callback(self.selected_char_id, visible_weeks[0], 0)
 
     def handle_presets_dialog(self):
         if self.selected_char_id is None:
             return
-
-        from PyQt6.QtWidgets import QListWidget, QSplitter
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Boss Presets")
@@ -4108,11 +3623,7 @@ class BossTrackerApp(QMainWindow):
             grid.setSpacing(6)
             grid.setContentsMargins(4, 4, 4, 4)
 
-            all_boss_files = []
-            if os.path.exists(BOSS_ASSETS_DIR):
-                for fname in sorted(os.listdir(BOSS_ASSETS_DIR)):
-                    if fname.lower().endswith('.png') and os.path.splitext(fname)[0].lower() not in MONTHLY_BOSSES:
-                        all_boss_files.append((fname, os.path.join(BOSS_ASSETS_DIR, fname)))
+            all_boss_files = [b for b in _boss_files() if b[1] not in MONTHLY_BOSSES]
 
             preset_by_path = {b["path"]: b for b in preset["bosses"]}
             row_widgets = []
@@ -4132,9 +3643,7 @@ class BossTrackerApp(QMainWindow):
                 " border-radius: 3px; padding: 2px 4px; font-size: 11px; }"
             )
 
-            for i, (fname, fpath) in enumerate(all_boss_files):
-                boss_name = os.path.splitext(fname)[0]
-                boss_key = boss_name.lower()
+            for i, (fpath, boss_key, boss_name) in enumerate(all_boss_files):
                 in_preset = fpath in preset_by_path
                 existing = preset_by_path.get(fpath, {})
 
@@ -4143,9 +3652,7 @@ class BossTrackerApp(QMainWindow):
                 cb.setStyleSheet("QCheckBox { color: white; }")
 
                 img_lbl = QLabel()
-                pix = QPixmap(fpath).scaled(28, 28, Qt.AspectRatioMode.KeepAspectRatio,
-                                            Qt.TransformationMode.SmoothTransformation)
-                img_lbl.setPixmap(pix)
+                img_lbl.setPixmap(_scaled_pixmap(fpath, 28))
                 img_lbl.setFixedSize(32, 32)
 
                 name_lbl = QLabel(boss_name)
@@ -4216,7 +3723,6 @@ class BossTrackerApp(QMainWindow):
             if not (0 <= row < len(self.boss_presets)):
                 QMessageBox.warning(dialog, "No Preset Selected", "Select a preset first.")
                 return
-            import copy
             src = self.boss_presets[row]
             new_name, ok = QInputDialog.getText(dialog, "Duplicate Preset", "Name for the copy:",
                                                 text=f"Copy of {src['name']}")
@@ -4229,21 +3735,8 @@ class BossTrackerApp(QMainWindow):
             preset_list.setCurrentRow(len(self.boss_presets) - 1)
 
         def do_save():
-            cid = self.selected_char_id
-            wkey = self.actual_current_week_key
-            bosses = []
-            if os.path.exists(BOSS_ASSETS_DIR):
-                for f in sorted(os.listdir(BOSS_ASSETS_DIR)):
-                    if not f.lower().endswith('.png'):
-                        continue
-                    fname = os.path.splitext(f)[0].lower()
-                    if fname in MONTHLY_BOSSES:
-                        continue
-                    full_path = os.path.join(BOSS_ASSETS_DIR, f)
-                    state, _ = self.resolve_boss_state_at_week(cid, wkey, full_path)
-                    if state and not state.get("is_deleted_marker", False):
-                        bosses.append({"path": full_path, "difficulty": state["difficulty"],
-                                       "party_size": state.get("party_size", 1)})
+            bosses = [{"path": p, "difficulty": s["difficulty"], "party_size": s.get("party_size", 1)}
+                      for p, _k, _r, s, _i in self._active_bosses(self.selected_char_id, self.actual_current_week_key)]
             if not bosses:
                 QMessageBox.warning(dialog, "No Bosses", "No bosses are set for the current week.")
                 return
@@ -4294,16 +3787,9 @@ class BossTrackerApp(QMainWindow):
             target_thursday = selected_date - timedelta(days=(selected_date.weekday() - 3) % 7)
             wkey = target_thursday.strftime("%Y-%m-%d")
 
-            explicit_list = self.saved_boss_clears.setdefault((cid, wkey), [])
             for b in preset["bosses"]:
-                existing = next((x for x in explicit_list if x["path"] == b["path"]), None)
-                if existing:
-                    existing["difficulty"] = b["difficulty"]
-                    existing["party_size"] = b.get("party_size", 1)
-                    existing["is_deleted_marker"] = False
-                else:
-                    explicit_list.append({"path": b["path"], "difficulty": b["difficulty"],
-                                          "party_size": b.get("party_size", 1), "is_deleted_marker": False})
+                self._upsert_stamp(cid, wkey, b["path"], difficulty=b["difficulty"],
+                                   party_size=b.get("party_size", 1), is_deleted_marker=False)
             self.save_data()
             self.update_boss_schedule_calendar()
             dialog.accept()
@@ -4327,7 +3813,7 @@ class BossTrackerApp(QMainWindow):
         dialog.exec()
 
     def handle_add_all_bosses_to_date(self):
-        if not os.path.exists(BOSS_ASSETS_DIR) or self.selected_char_id is None:
+        if self.selected_char_id is None:
             return
 
         dialog = QDialog(self)
@@ -4370,20 +3856,11 @@ class BossTrackerApp(QMainWindow):
         cursor = target_thursday
         while cursor <= self.actual_current_thursday:
             apply_wkey = cursor.strftime("%Y-%m-%d")
-            for f in sorted(os.listdir(BOSS_ASSETS_DIR)):
-                if not f.lower().endswith('.png'):
+            for path, key, _raw in _boss_files():
+                if key in MONTHLY_BOSSES:
                     continue
-                filename_clean = os.path.splitext(f)[0].lower()
-                if filename_clean in MONTHLY_BOSSES:
-                    continue
-                full_path = os.path.join(BOSS_ASSETS_DIR, f)
-                explicit_list = self.saved_boss_clears.setdefault((cid, apply_wkey), [])
-                existing = next((b for b in explicit_list if b["path"] == full_path), None)
-                if existing:
-                    explicit_list.remove(existing)
-                initial_tier = _default_difficulty(filename_clean)
-                explicit_list.append(
-                    {"path": full_path, "difficulty": initial_tier, "party_size": 1, "is_deleted_marker": False})
+                self._upsert_stamp(cid, apply_wkey, path, difficulty=_default_difficulty(key),
+                                   party_size=1, is_deleted_marker=False)
             cursor += timedelta(days=7)
 
         self.save_data()
@@ -4570,15 +4047,6 @@ class BossTrackerApp(QMainWindow):
             task["linked"] = link
         self.save_data()
         self._refresh_char_tasks_tab()
-
-    def _refresh_char_tasks_header(self):
-        if not hasattr(self, 'char_tasks_header') or self.selected_char_id is None:
-            return
-        tasks = self.char_tasks.get(self.selected_char_id, [])
-        done_count = sum(1 for t in tasks if t["done"])
-        char = next((c for c in self.characters if c["id"] == self.selected_char_id), None)
-        name = char["name"] if char else "Character"
-        self.char_tasks_header.setText(f"Tasks for {name}  —  {done_count}/{len(tasks)} done")
 
     def _add_char_task(self):
         if self.selected_char_id is None:
@@ -5126,17 +4594,11 @@ class BossTrackerApp(QMainWindow):
             self.update_all_tasks_page()
 
     def _goto_char_from_tasks(self, char_id):
-        for attr in ('tab_stats', 'tab_version_history', 'tab_all_tasks', 'tab_item_results', 'tab_pitched_items'):
-            btn = getattr(self, attr, None)
-            if btn:
-                btn.setChecked(False)
-        if hasattr(self, 'tab_tracker'):
-            self.tab_tracker.setChecked(True)
-        if hasattr(self, 'inline_calendar_drawer'):
-            self.inline_calendar_drawer.setVisible(False)
+        for idx, btn in self._tab_buttons.items():
+            btn.setChecked(idx == 0)
+        self.inline_calendar_drawer.setVisible(False)
         self.enter_character_boss_view(char_id)
-        if hasattr(self, 'boss_schedule_stats_tabs'):
-            self.boss_schedule_stats_tabs.setCurrentIndex(0)
+        self.boss_schedule_stats_tabs.setCurrentIndex(0)
 
     def _goto_linked_item_result(self, link):
         if not link:
@@ -5463,18 +4925,7 @@ class BossTrackerApp(QMainWindow):
             upgrades = entry.get("upgrades", [])
             undone_rows = [(i, u) for i, u in enumerate(upgrades) if not u.get("done")]
             done_rows = [(i, u) for i, u in enumerate(upgrades) if u.get("done")]
-            common_kwargs = dict(
-                on_toggle=lambda ui, state, i=idx: self._toggle_char_item_upgrade_done(i, ui, state),
-                on_amount_add=lambda ui, delta, i=idx: self._add_char_item_upgrade_amount(i, ui, delta),
-                on_amount_set=lambda ui, value, i=idx: self._set_char_item_upgrade_amount(i, ui, value),
-                on_type_change=lambda ui, text, i=idx: self._set_char_item_upgrade_type(i, ui, text),
-                on_result_change=lambda ui, text, i=idx: self._set_char_item_upgrade_result(i, ui, text),
-                on_target_change=lambda ui, text, i=idx: self._set_char_item_upgrade_target(i, ui, text),
-                on_delete_upgrade=lambda ui, i=idx: self._delete_char_item_upgrade(i, ui),
-                on_add_upgrade=lambda _, i=idx: self._add_upgrade_type_to_char_item(i),
-                on_delete_item=lambda _, i=idx: self._delete_char_item_entry(i),
-                on_rename_item=lambda _, i=idx: self._rename_char_item_entry(i),
-            )
+            common_kwargs = self._item_group_kwargs(self.selected_char_id, idx, self._refresh_char_item_results_tab)
             if undone_rows:
                 any_undone = True
                 undone_layout.addWidget(self._make_item_group_frame(entry, undone_rows, **common_kwargs))
@@ -5567,8 +5018,7 @@ class BossTrackerApp(QMainWindow):
                     icon_lbl = QLabel()
                     icon_lbl.setFixedSize(35, 35)
                     if icon_path and os.path.exists(icon_path):
-                        icon_lbl.setPixmap(QPixmap(icon_path).scaled(
-                            35, 35, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+                        icon_lbl.setPixmap(_scaled_pixmap(icon_path, 35))
                     else:
                         icon_lbl.setText(entry["name"][:1].upper())
                         icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -5863,8 +5313,7 @@ class BossTrackerApp(QMainWindow):
         if icon_path and os.path.exists(icon_path):
             icon_lbl = QLabel()
             icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            icon_lbl.setPixmap(QPixmap(icon_path).scaled(
-                22, 22, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            icon_lbl.setPixmap(_scaled_pixmap(icon_path, 22))
             vbox.addWidget(icon_lbl)
 
         num_lbl = QLabel(str(value))
@@ -6036,135 +5485,40 @@ class BossTrackerApp(QMainWindow):
         self.save_data()
         self.update_pitched_items_page()
 
-    def _toggle_char_item_upgrade_done(self, item_idx, upg_idx, state):
-        entries = self.char_item_results.get(self.selected_char_id, [])
-        if not (0 <= item_idx < len(entries)):
-            return
-        upgrades = entries[item_idx].get("upgrades", [])
-        if 0 <= upg_idx < len(upgrades):
-            done = (state != 0)
-            upgrades[upg_idx]["done"] = done
-            upgrades[upg_idx]["closed"] = self._today_str() if done else None
-            self._sync_linked_tasks_from_upgrade(self.selected_char_id, item_idx, upg_idx, done)
-            self.save_data()
-            self._refresh_char_item_results_tab()
+    # --- Item Results: one handler set shared by the per-character tab and the global page.
+    #     `refresh` is whichever view the edit came from; defaults to the global page.
 
-    def _add_char_item_upgrade_amount(self, item_idx, upg_idx, delta):
-        entries = self.char_item_results.get(self.selected_char_id, [])
-        if not (0 <= item_idx < len(entries)):
-            return
-        upgrades = entries[item_idx].get("upgrades", [])
-        if 0 <= upg_idx < len(upgrades):
-            upgrades[upg_idx]["amount"] = upgrades[upg_idx].get("amount", 0) + delta
-            self.save_data()
-            self._refresh_char_item_results_tab()
+    def _new_upgrade(self, upgrade_type, opened=None):
+        return {"upgrade_type": upgrade_type, "amount": 0, "result": "", "target": "", "done": False,
+                "opened": opened or self._today_str(), "closed": None}
 
-    def _set_char_item_upgrade_amount(self, item_idx, upg_idx, value):
-        entries = self.char_item_results.get(self.selected_char_id, [])
-        if not (0 <= item_idx < len(entries)):
-            return
-        upgrades = entries[item_idx].get("upgrades", [])
-        if 0 <= upg_idx < len(upgrades):
-            upgrades[upg_idx]["amount"] = value
-            self.save_data()
-            self._refresh_char_item_results_tab()
+    def _item_entry(self, cid, item_idx):
+        entries = self.char_item_results.get(cid, [])
+        return entries[item_idx] if 0 <= item_idx < len(entries) else None
 
-    def _set_char_item_upgrade_type(self, item_idx, upg_idx, text):
-        if not text:
-            self._refresh_char_item_results_tab()
-            return
-        entries = self.char_item_results.get(self.selected_char_id, [])
-        if not (0 <= item_idx < len(entries)):
-            return
-        upgrades = entries[item_idx].get("upgrades", [])
-        if 0 <= upg_idx < len(upgrades):
-            upgrades[upg_idx]["upgrade_type"] = text
-            self.save_data()
-            self._refresh_char_item_results_tab()
+    def _upgrade_at(self, cid, item_idx, upg_idx):
+        entry = self._item_entry(cid, item_idx)
+        upgrades = entry.get("upgrades", []) if entry else []
+        return upgrades[upg_idx] if 0 <= upg_idx < len(upgrades) else None
 
-    def _set_char_item_upgrade_result(self, item_idx, upg_idx, text):
-        entries = self.char_item_results.get(self.selected_char_id, [])
-        if not (0 <= item_idx < len(entries)):
-            return
-        upgrades = entries[item_idx].get("upgrades", [])
-        if 0 <= upg_idx < len(upgrades):
-            upgrades[upg_idx]["result"] = text
-            self.save_data()
-            self._refresh_char_item_results_tab()
-
-    def _set_char_item_upgrade_target(self, item_idx, upg_idx, text):
-        entries = self.char_item_results.get(self.selected_char_id, [])
-        if not (0 <= item_idx < len(entries)):
-            return
-        upgrades = entries[item_idx].get("upgrades", [])
-        if 0 <= upg_idx < len(upgrades):
-            upgrades[upg_idx]["target"] = text
-            self.save_data()
-            self._refresh_char_item_results_tab()
-
-    def _delete_char_item_upgrade(self, item_idx, upg_idx):
-        entries = self.char_item_results.get(self.selected_char_id, [])
-        if not (0 <= item_idx < len(entries)):
-            return
-        upgrades = entries[item_idx].get("upgrades", [])
-        if 0 <= upg_idx < len(upgrades):
-            self._clear_or_shift_task_links(self.selected_char_id, item_idx, upg_idx)
-            upgrades.pop(upg_idx)
-            if not upgrades:
-                entries.pop(item_idx)
-                self._clear_or_shift_task_links(self.selected_char_id, item_idx, None)
-            self.save_data()
-            self._refresh_char_item_results_tab()
-
-    def _add_upgrade_type_to_char_item(self, item_idx):
-        entries = self.char_item_results.get(self.selected_char_id, [])
-        if not (0 <= item_idx < len(entries)):
-            return
-        text = self._prompt_upgrade_type_text(entries[item_idx].get("item", ""))
-        if text is None:
-            return
-        entries[item_idx].setdefault("upgrades", []).append(
-            {"upgrade_type": text, "amount": 0, "result": "", "target": "", "done": False,
-             "opened": self._today_str(), "closed": None})
+    def _commit_item_results(self, refresh):
         self.save_data()
-        self._refresh_char_item_results_tab()
+        (refresh or self.update_item_results_page)()
 
-    def _delete_char_item_entry(self, item_idx):
-        entries = self.char_item_results.get(self.selected_char_id, [])
-        if 0 <= item_idx < len(entries):
-            entries.pop(item_idx)
-            self._clear_or_shift_task_links(self.selected_char_id, item_idx, None)
-            self.save_data()
-            self._refresh_char_item_results_tab()
-
-    def _rename_char_item_entry(self, item_idx):
-        entries = self.char_item_results.get(self.selected_char_id, [])
-        if not (0 <= item_idx < len(entries)):
-            return
-        text, ok = QInputDialog.getText(self, "Rename Item", "Item name:", text=entries[item_idx].get("item", ""))
-        if ok and text.strip():
-            entries[item_idx]["item"] = text.strip()
-            self.save_data()
-            self._refresh_char_item_results_tab()
-
-    def _add_char_item_result(self):
-        if self.selected_char_id is None:
-            return
-        data = self._prompt_add_item_dialog("Add Item Result")
+    def _add_item_result(self, cid, title, refresh=None):
+        data = self._prompt_add_item_dialog(title)
         if data is None:
             return
         today = self._today_str()
-        entry = {
-            "item": data["item"],
-            "opened": today,
-            "upgrades": [
-                {"upgrade_type": ut, "amount": 0, "result": "", "target": "", "done": False, "opened": today, "closed": None}
-                for ut in data["upgrade_types"]
-            ],
-        }
-        self.char_item_results.setdefault(self.selected_char_id, []).append(entry)
-        self.save_data()
-        self._refresh_char_item_results_tab()
+        self.char_item_results.setdefault(cid, []).append({
+            "item": data["item"], "opened": today,
+            "upgrades": [self._new_upgrade(ut, today) for ut in data["upgrade_types"]],
+        })
+        self._commit_item_results(refresh)
+
+    def _add_char_item_result(self):
+        if self.selected_char_id is not None:
+            self._add_item_result(self.selected_char_id, "Add Item Result", self._refresh_char_item_results_tab)
 
     def _add_char_result_from_global(self):
         if not self.characters:
@@ -6174,134 +5528,87 @@ class BossTrackerApp(QMainWindow):
         if not ok:
             return
         char = next((c for c in self.characters if c["name"] == name), None)
-        if not char:
-            return
-        data = self._prompt_add_item_dialog(f"Add Item Result — {name}")
-        if data is None:
-            return
-        today = self._today_str()
-        entry = {
-            "item": data["item"],
-            "opened": today,
-            "upgrades": [
-                {"upgrade_type": ut, "amount": 0, "result": "", "target": "", "done": False, "opened": today, "closed": None}
-                for ut in data["upgrade_types"]
-            ],
-        }
-        self.char_item_results.setdefault(char["id"], []).append(entry)
-        self.save_data()
-        self.update_item_results_page()
+        if char:
+            self._add_item_result(char["id"], f"Add Item Result — {name}")
 
-    def _toggle_item_result_upgrade_done_global(self, cid, item_idx, upg_idx, state):
-        entries = self.char_item_results.get(cid, [])
-        if not (0 <= item_idx < len(entries)):
+    def _toggle_item_upgrade_done(self, cid, item_idx, upg_idx, state, refresh=None):
+        upg = self._upgrade_at(cid, item_idx, upg_idx)
+        if upg is None:
             return
-        upgrades = entries[item_idx].get("upgrades", [])
-        if 0 <= upg_idx < len(upgrades):
-            done = (state != 0)
-            upgrades[upg_idx]["done"] = done
-            upgrades[upg_idx]["closed"] = self._today_str() if done else None
-            self._sync_linked_tasks_from_upgrade(cid, item_idx, upg_idx, done)
-            self.save_data()
-            self.update_item_results_page()
+        done = (state != 0)
+        upg["done"] = done
+        upg["closed"] = self._today_str() if done else None
+        self._sync_linked_tasks_from_upgrade(cid, item_idx, upg_idx, done)
+        self._commit_item_results(refresh)
 
-    def _add_item_upgrade_amount_global(self, cid, item_idx, upg_idx, delta):
-        entries = self.char_item_results.get(cid, [])
-        if not (0 <= item_idx < len(entries)):
-            return
-        upgrades = entries[item_idx].get("upgrades", [])
-        if 0 <= upg_idx < len(upgrades):
-            upgrades[upg_idx]["amount"] = upgrades[upg_idx].get("amount", 0) + delta
-            self.save_data()
-            self.update_item_results_page()
+    def _add_item_upgrade_amount(self, cid, item_idx, upg_idx, delta, refresh=None):
+        upg = self._upgrade_at(cid, item_idx, upg_idx)
+        if upg is not None:
+            upg["amount"] = upg.get("amount", 0) + delta
+            self._commit_item_results(refresh)
 
-    def _set_item_upgrade_amount_global(self, cid, item_idx, upg_idx, value):
-        entries = self.char_item_results.get(cid, [])
-        if not (0 <= item_idx < len(entries)):
+    def _set_item_upgrade_field(self, cid, item_idx, upg_idx, field, value, refresh=None):
+        if field == "upgrade_type" and not value:
+            (refresh or self.update_item_results_page)()
             return
-        upgrades = entries[item_idx].get("upgrades", [])
-        if 0 <= upg_idx < len(upgrades):
-            upgrades[upg_idx]["amount"] = value
-            self.save_data()
-            self.update_item_results_page()
+        upg = self._upgrade_at(cid, item_idx, upg_idx)
+        if upg is not None:
+            upg[field] = value
+            self._commit_item_results(refresh)
 
-    def _set_item_upgrade_type_global(self, cid, item_idx, upg_idx, text):
-        if not text:
-            self.update_item_results_page()
+    def _delete_item_upgrade(self, cid, item_idx, upg_idx, refresh=None):
+        entry = self._item_entry(cid, item_idx)
+        upgrades = entry.get("upgrades", []) if entry else []
+        if not (0 <= upg_idx < len(upgrades)):
             return
-        entries = self.char_item_results.get(cid, [])
-        if not (0 <= item_idx < len(entries)):
-            return
-        upgrades = entries[item_idx].get("upgrades", [])
-        if 0 <= upg_idx < len(upgrades):
-            upgrades[upg_idx]["upgrade_type"] = text
-            self.save_data()
-            self.update_item_results_page()
+        self._clear_or_shift_task_links(cid, item_idx, upg_idx)
+        upgrades.pop(upg_idx)
+        if not upgrades:
+            self.char_item_results[cid].pop(item_idx)
+            self._clear_or_shift_task_links(cid, item_idx, None)
+        self._commit_item_results(refresh)
 
-    def _set_item_upgrade_result_global(self, cid, item_idx, upg_idx, text):
-        entries = self.char_item_results.get(cid, [])
-        if not (0 <= item_idx < len(entries)):
+    def _add_upgrade_type_to_item(self, cid, item_idx, refresh=None):
+        entry = self._item_entry(cid, item_idx)
+        if entry is None:
             return
-        upgrades = entries[item_idx].get("upgrades", [])
-        if 0 <= upg_idx < len(upgrades):
-            upgrades[upg_idx]["result"] = text
-            self.save_data()
-            self.update_item_results_page()
-
-    def _set_item_upgrade_target_global(self, cid, item_idx, upg_idx, text):
-        entries = self.char_item_results.get(cid, [])
-        if not (0 <= item_idx < len(entries)):
-            return
-        upgrades = entries[item_idx].get("upgrades", [])
-        if 0 <= upg_idx < len(upgrades):
-            upgrades[upg_idx]["target"] = text
-            self.save_data()
-            self.update_item_results_page()
-
-    def _delete_item_upgrade_global(self, cid, item_idx, upg_idx):
-        entries = self.char_item_results.get(cid, [])
-        if not (0 <= item_idx < len(entries)):
-            return
-        upgrades = entries[item_idx].get("upgrades", [])
-        if 0 <= upg_idx < len(upgrades):
-            self._clear_or_shift_task_links(cid, item_idx, upg_idx)
-            upgrades.pop(upg_idx)
-            if not upgrades:
-                entries.pop(item_idx)
-                self._clear_or_shift_task_links(cid, item_idx, None)
-            self.save_data()
-            self.update_item_results_page()
-
-    def _add_upgrade_type_to_item_global(self, cid, item_idx):
-        entries = self.char_item_results.get(cid, [])
-        if not (0 <= item_idx < len(entries)):
-            return
-        text = self._prompt_upgrade_type_text(entries[item_idx].get("item", ""))
+        text = self._prompt_upgrade_type_text(entry.get("item", ""))
         if text is None:
             return
-        entries[item_idx].setdefault("upgrades", []).append(
-            {"upgrade_type": text, "amount": 0, "result": "", "target": "", "done": False,
-             "opened": self._today_str(), "closed": None})
-        self.save_data()
-        self.update_item_results_page()
+        entry.setdefault("upgrades", []).append(self._new_upgrade(text))
+        self._commit_item_results(refresh)
 
-    def _delete_item_entry_global(self, cid, item_idx):
-        entries = self.char_item_results.get(cid, [])
-        if 0 <= item_idx < len(entries):
-            entries.pop(item_idx)
-            self._clear_or_shift_task_links(cid, item_idx, None)
-            self.save_data()
-            self.update_item_results_page()
-
-    def _rename_item_entry_global(self, cid, item_idx):
-        entries = self.char_item_results.get(cid, [])
-        if not (0 <= item_idx < len(entries)):
+    def _delete_item_entry(self, cid, item_idx, refresh=None):
+        if self._item_entry(cid, item_idx) is None:
             return
-        text, ok = QInputDialog.getText(self, "Rename Item", "Item name:", text=entries[item_idx].get("item", ""))
+        self.char_item_results[cid].pop(item_idx)
+        self._clear_or_shift_task_links(cid, item_idx, None)
+        self._commit_item_results(refresh)
+
+    def _rename_item_entry(self, cid, item_idx, refresh=None):
+        entry = self._item_entry(cid, item_idx)
+        if entry is None:
+            return
+        text, ok = QInputDialog.getText(self, "Rename Item", "Item name:", text=entry.get("item", ""))
         if ok and text.strip():
-            entries[item_idx]["item"] = text.strip()
-            self.save_data()
-            self.update_item_results_page()
+            entry["item"] = text.strip()
+            self._commit_item_results(refresh)
+
+    def _item_group_kwargs(self, cid, idx, refresh=None):
+        """Callback set for one item's group frame, bound to (cid, item idx) and the originating view."""
+        R = refresh
+        return dict(
+            on_toggle=lambda ui, state: self._toggle_item_upgrade_done(cid, idx, ui, state, R),
+            on_amount_add=lambda ui, delta: self._add_item_upgrade_amount(cid, idx, ui, delta, R),
+            on_amount_set=lambda ui, value: self._set_item_upgrade_field(cid, idx, ui, "amount", value, R),
+            on_type_change=lambda ui, text: self._set_item_upgrade_field(cid, idx, ui, "upgrade_type", text, R),
+            on_result_change=lambda ui, text: self._set_item_upgrade_field(cid, idx, ui, "result", text, R),
+            on_target_change=lambda ui, text: self._set_item_upgrade_field(cid, idx, ui, "target", text, R),
+            on_delete_upgrade=lambda ui: self._delete_item_upgrade(cid, idx, ui, R),
+            on_add_upgrade=lambda _: self._add_upgrade_type_to_item(cid, idx, R),
+            on_delete_item=lambda _: self._delete_item_entry(cid, idx, R),
+            on_rename_item=lambda _: self._rename_item_entry(cid, idx, R),
+        )
 
     def build_item_results_page(self):
         page = QWidget()
@@ -6729,18 +6036,7 @@ class BossTrackerApp(QMainWindow):
                 upgrades = entry.get("upgrades", [])
                 undone_rows = [(i, u) for i, u in enumerate(upgrades) if not u.get("done")]
                 done_rows = [(i, u) for i, u in enumerate(upgrades) if u.get("done")]
-                common_kwargs = dict(
-                    on_toggle=lambda ui, state, c=cid, i=idx: self._toggle_item_result_upgrade_done_global(c, i, ui, state),
-                    on_amount_add=lambda ui, delta, c=cid, i=idx: self._add_item_upgrade_amount_global(c, i, ui, delta),
-                    on_amount_set=lambda ui, value, c=cid, i=idx: self._set_item_upgrade_amount_global(c, i, ui, value),
-                    on_type_change=lambda ui, text, c=cid, i=idx: self._set_item_upgrade_type_global(c, i, ui, text),
-                    on_result_change=lambda ui, text, c=cid, i=idx: self._set_item_upgrade_result_global(c, i, ui, text),
-                    on_target_change=lambda ui, text, c=cid, i=idx: self._set_item_upgrade_target_global(c, i, ui, text),
-                    on_delete_upgrade=lambda ui, c=cid, i=idx: self._delete_item_upgrade_global(c, i, ui),
-                    on_add_upgrade=lambda _, c=cid, i=idx: self._add_upgrade_type_to_item_global(c, i),
-                    on_delete_item=lambda _, c=cid, i=idx: self._delete_item_entry_global(c, i),
-                    on_rename_item=lambda _, c=cid, i=idx: self._rename_item_entry_global(c, i),
-                )
+                common_kwargs = self._item_group_kwargs(cid, idx)
                 if undone_rows:
                     undone_frames.append(self._make_item_group_frame(entry, undone_rows, **common_kwargs))
                 if done_rows:
