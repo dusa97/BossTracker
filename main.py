@@ -3273,6 +3273,37 @@ class BossTrackerApp(QMainWindow):
             cursor += timedelta(days=7)
         return run
 
+    def _edit_scope(self, cid, wkey, path, state):
+        """Weeks an edit applies to. An edit to a past week normally bleeds forward through the
+        whole inherited run, so ask first; "this week only" pins the next week to its current
+        state, which stops the inheritance there."""
+        run = self._forward_run(cid, wkey, path, state)
+        if wkey >= self.actual_current_week_key or len(run) < 2:
+            return run
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Apply Change")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("This is a past week.")
+        box.setInformativeText(
+            f"This boss carries the same setting through {len(run)} weeks, up to the current week."
+            "\n\n"
+            "Apply the change to just this week, or to all of them?")
+        only_btn = box.addButton("This Week Only", QMessageBox.ButtonRole.AcceptRole)
+        all_btn = box.addButton(f"All {len(run)} Weeks", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setStyleSheet("QLabel { color: #e0e0e0; } QMessageBox { background-color: #1c1c1c; }")
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is all_btn:
+            return run
+        if clicked is not only_btn:
+            return []
+        next_wkey, next_state = run[1]
+        self._upsert_stamp(cid, next_wkey, path, dict(next_state))
+        return run[:1]
+
     def drop_boss_callback(self, cid, wkey, path):
         filename_clean = os.path.splitext(os.path.basename(path))[0].lower()
         self._upsert_stamp(cid, wkey, path, difficulty=_default_difficulty(filename_clean),
@@ -3465,7 +3496,7 @@ class BossTrackerApp(QMainWindow):
         allowed_tiers = list(BOSS_DIFFICULTY_MAP.get(key, {"Normal": 0, "Hard": 0}).keys())
         new_difficulty = allowed_tiers[(allowed_tiers.index(current_state["difficulty"]) + 1) % len(allowed_tiers)]
 
-        for apply_wkey, ws in self._forward_run(cid, wkey, target_path, current_state):
+        for apply_wkey, ws in self._edit_scope(cid, wkey, target_path, current_state):
             self._upsert_stamp(cid, apply_wkey, target_path, {"party_size": ws.get("party_size", 1)},
                                difficulty=new_difficulty, is_deleted_marker=False)
         self.save_data()
@@ -3482,7 +3513,7 @@ class BossTrackerApp(QMainWindow):
         if not ok:
             return
 
-        for apply_wkey, ws in self._forward_run(cid, wkey, target_path, current_state):
+        for apply_wkey, ws in self._edit_scope(cid, wkey, target_path, current_state):
             self._upsert_stamp(cid, apply_wkey, target_path, {"difficulty": ws.get("difficulty", "Normal")},
                                party_size=new_size, is_deleted_marker=False)
         self.save_data()
@@ -3493,7 +3524,7 @@ class BossTrackerApp(QMainWindow):
         if hit is None:
             return
         target_path, _key, clicked_state = hit
-        for apply_wkey, _ws in self._forward_run(cid, wkey, target_path, clicked_state):
+        for apply_wkey, _ws in self._edit_scope(cid, wkey, target_path, clicked_state):
             self._upsert_stamp(cid, apply_wkey, target_path, is_deleted_marker=True)
         self.save_data()
         self.update_boss_schedule_calendar()
