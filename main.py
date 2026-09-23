@@ -37,7 +37,7 @@ SOURCES_ASSETS_DIR = os.path.join(_BASE_DIR, "sources")
 DATA_FILE        = os.path.join(_BASE_DIR, "boss_tracker_data.json")
 _BM_PATH = os.path.join(BOSS_ASSETS_DIR, "BlackMage.png")
 NUM_WEEKS_TO_SHOW = 4
-APP_VERSION = "v1.30"
+APP_VERSION = "v1.31"
 
 # Item Scanner (F9 tooltip capture/OCR) is built but hidden from the UI for now — flip to True
 # to bring back the tab and the F9 global hotkey. Nothing else needs to change.
@@ -125,6 +125,8 @@ PITCHED_ITEMS = [
     ("Blissful Nightmare", "Blissful Nightmare.png"),
     ("Whisper of the Source", "Whisper of the Source.png"),
     ("Oath of Death", "Oath of Death.png"),
+    ("Immortal Legacy", "Immortal Legacy.png"),
+    ("Original Sin of Pride", "Original Sin of Pride.png"),
     ("DayBreak", "DayBreak.png"),
     ("Slime Ring", "Slime Ring.png"),
     ("Eternal Hat", "Eternal Hat.png"),
@@ -2400,6 +2402,9 @@ class BossTrackerApp(QMainWindow):
         layout.addWidget(title)
 
         versions = [
+            ("v1.31", "2026-09-23", [
+                "All five Brilliant items are now consistent everywhere. Immortal Legacy and Original Sin of Pride were missing from the Pitched Items '+ Add Item' list, so only three of the five could be tracked there.",
+            ]),
             ("v1.30", "2026-09-23", [
                 "Original Sin of Pride is now grouped under Brilliant in the Item Inventory and the drop-rate category filters, instead of falling into Others.",
             ]),
