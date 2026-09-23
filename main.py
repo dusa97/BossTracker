@@ -37,7 +37,7 @@ SOURCES_ASSETS_DIR = os.path.join(_BASE_DIR, "sources")
 DATA_FILE        = os.path.join(_BASE_DIR, "boss_tracker_data.json")
 _BM_PATH = os.path.join(BOSS_ASSETS_DIR, "BlackMage.png")
 NUM_WEEKS_TO_SHOW = 4
-APP_VERSION = "v1.29"
+APP_VERSION = "v1.30"
 
 # Item Scanner (F9 tooltip capture/OCR) is built but hidden from the UI for now — flip to True
 # to bring back the tab and the F9 global hotkey. Nothing else needs to change.
@@ -98,6 +98,7 @@ ITEM_CATEGORIES = [
     }),
     ("Brilliant", "#3498db", {
         "blissful nightmare", "whisper of the source", "oath of death", "immortal legacy",
+        "original sin of pride",
     }),
     # Filled in from the user's own saved items — see BossTrackerApp._apply_custom_items.
     ("Custom", "#2ecc71", set()),
@@ -2399,6 +2400,9 @@ class BossTrackerApp(QMainWindow):
         layout.addWidget(title)
 
         versions = [
+            ("v1.30", "2026-09-23", [
+                "Original Sin of Pride is now grouped under Brilliant in the Item Inventory and the drop-rate category filters, instead of falling into Others.",
+            ]),
             ("v1.29", "2026-09-23", [
                 "Added Hard Jupiter (5,953,000,000 crystal meso), dropping Grindstone of Faith, Eternal Armor Box (Limbo), Life Boss Ring Box and the new Original Sin of Pride. Normal Jupiter is unchanged and still drops Grindstone of Faith only.",
                 "Replaced Jupiter's boss icon with its in-game portrait.",
