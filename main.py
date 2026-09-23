@@ -37,7 +37,7 @@ SOURCES_ASSETS_DIR = os.path.join(_BASE_DIR, "sources")
 DATA_FILE        = os.path.join(_BASE_DIR, "boss_tracker_data.json")
 _BM_PATH = os.path.join(BOSS_ASSETS_DIR, "BlackMage.png")
 NUM_WEEKS_TO_SHOW = 4
-APP_VERSION = "v1.27"
+APP_VERSION = "v1.28"
 
 # Item Scanner (F9 tooltip capture/OCR) is built but hidden from the UI for now — flip to True
 # to bring back the tab and the F9 global hotkey. Nothing else needs to change.
@@ -99,8 +99,19 @@ ITEM_CATEGORIES = [
     ("Brilliant", "#3498db", {
         "blissful nightmare", "whisper of the source", "oath of death", "immortal legacy",
     }),
+    # Filled in from the user's own saved items — see BossTrackerApp._apply_custom_items.
+    ("Custom", "#2ecc71", set()),
     ("Others", "#888888", set()),
 ]
+CUSTOM_CATEGORY_NAMES = ITEM_CATEGORIES[-2][2]
+
+
+def _hidden_from_shelf(name):
+    """The Eternal gear pieces clutter the main page's Item Inventory — only the two
+    Eternal Armor Boxes belong there. The files stay put, so every other screen that
+    reads the assets folder still sees them."""
+    n = name.lower()
+    return n.startswith("eternal ") and "box" not in n
 
 PITCHED_ITEMS = [
     ("Berserked", "Berserked.png"),
@@ -163,6 +174,10 @@ BOSS_DROPS = {
     ("malefic star", "Hard"):       ["Grindstone of Faith", "Eternal Armor Box (Kalos)", "Life Boss Ring Box", "Blissful Nightmare"],
     ("jupiter", "Normal"):          ["Grindstone of Faith"],
 }
+
+# Pristine copy of the built-in drop table. Custom items are merged on top of this each
+# time they change, so removing one actually takes its drops back out.
+_BUILTIN_BOSS_DROPS = {k: list(v) for k, v in BOSS_DROPS.items()}
 
 
 def _item_state(item):
@@ -1188,6 +1203,8 @@ class BossTrackerApp(QMainWindow):
         self.saved_item_drops = {}
         self.saved_boss_clears = {}
         self.boss_presets = []
+        self.custom_items = []
+        self.items_shelf_layout = None
         self.selected_char_id = None
         self._resolve_cache = {}
         self._stats_dirty = True
@@ -1296,6 +1313,7 @@ class BossTrackerApp(QMainWindow):
             "characters": self.characters,
             "char_id_counter": self.char_id_counter,
             "boss_presets": self.boss_presets,
+            "custom_items": self.custom_items,
             "last_seen_week": self.actual_current_week_key,
             "label_font_size": LABEL_FONT_SIZE,
             "char_completed_weeks": list(self.char_completed_weeks),
@@ -1328,6 +1346,7 @@ class BossTrackerApp(QMainWindow):
             self.characters = data.get("characters", [])
             self.char_id_counter = data.get("char_id_counter", 0)
             self.boss_presets = data.get("boss_presets", [])
+            self.custom_items = data.get("custom_items", [])
             self.saved_item_drops = {
                 (int(k.split("|")[0]), k.split("|")[1]): v
                 for k, v in data.get("saved_item_drops", {}).items()
@@ -1424,7 +1443,230 @@ class BossTrackerApp(QMainWindow):
                             u["target"] = ""
                 migrated.append(entry)
             self.char_item_results[cid] = migrated
+        self._apply_custom_items()
         self.save_data()
+
+    def _populate_items_shelf(self):
+        """(Re)fill the main page's Item Inventory from the assets folder, grouped by category."""
+        while self.items_shelf_layout.count():
+            w = self.items_shelf_layout.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        if not os.path.exists(ITEMS_ASSETS_DIR):
+            return
+
+        all_items = [
+            (os.path.splitext(f)[0], f)
+            for f in sorted(os.listdir(ITEMS_ASSETS_DIR))
+            if f.lower().endswith('.png') and not _hidden_from_shelf(os.path.splitext(f)[0])
+        ]
+        buckets = {cat: [] for cat, _, _ in ITEM_CATEGORIES}
+        for name, file in all_items:
+            name_lower = name.lower()
+            placed = False
+            for cat, _, names in ITEM_CATEGORIES[:-1]:
+                if name_lower in names:
+                    buckets[cat].append((name, file))
+                    placed = True
+                    break
+            if not placed:
+                buckets["Others"].append((name, file))
+
+        row_idx = 0
+        for cat, color, _ in ITEM_CATEGORIES:
+            items = buckets[cat]
+            if not items:
+                continue
+            sep = QLabel(cat)
+            sep.setStyleSheet(
+                f"color: {color}; font-size: 11px; font-weight: bold;"
+                " padding: 4px 2px 2px 4px; background: transparent;")
+            self.items_shelf_layout.addWidget(sep, row_idx, 0, 1, 3)
+            row_idx += 1
+            col_idx = 0
+            for name, file in items:
+                item_widget = DraggableAssetItem(name, os.path.join(ITEMS_ASSETS_DIR, file))
+                self.items_shelf_layout.addWidget(item_widget, row_idx, col_idx)
+                col_idx += 1
+                if col_idx >= 3:
+                    col_idx = 0
+                    row_idx += 1
+            if col_idx != 0:
+                row_idx += 1
+
+    # ==========================================
+    # USER-DEFINED ITEMS
+    # ==========================================
+    def _apply_custom_items(self):
+        """Fold the user's own items into the built-in drop table, then refresh the shelf.
+
+        Everything downstream (drop-rate stats, the boss totals table, and the "which boss
+        did this come from?" picker) reads BOSS_DROPS, so merging here is all that's needed
+        to make custom items behave like built-in ones. A custom item is tied to whole
+        bosses rather than single difficulties, so it is registered on every tier."""
+        BOSS_DROPS.clear()
+        BOSS_DROPS.update({k: list(v) for k, v in _BUILTIN_BOSS_DROPS.items()})
+        CUSTOM_CATEGORY_NAMES.clear()
+
+        for item in self.custom_items:
+            CUSTOM_CATEGORY_NAMES.add(item["name"].lower())
+            for boss_key in item.get("bosses", []):
+                for diff in BOSS_DIFFICULTY_MAP.get(boss_key, {"Normal": 0}):
+                    drops = BOSS_DROPS.setdefault((boss_key, diff), [])
+                    if item["name"] not in drops:
+                        drops.append(item["name"])
+
+        self._resolve_cache.clear()
+        self._stats_dirty = True
+        if self.items_shelf_layout is not None:
+            self._populate_items_shelf()
+
+    def _custom_item_path(self, item):
+        return os.path.join(ITEMS_ASSETS_DIR, item["file"])
+
+    def add_custom_item_dialog(self):
+        """Name + image + the bosses that drop it. Also lists existing custom items so a
+        mistake can be taken back out without hand-editing the save file."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Custom Items")
+        dialog.setMinimumWidth(460)
+        dialog.setStyleSheet("background-color: #1c1c1c; color: #e0e0e0;")
+        outer = QVBoxLayout(dialog)
+
+        form = QHBoxLayout()
+        preview = QLabel("no\nimage")
+        preview.setFixedSize(64, 64)
+        preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview.setStyleSheet("border: 1px dashed #444; color: #666; font-size: 10px; border-radius: 4px;")
+        form.addWidget(preview)
+
+        right = QVBoxLayout()
+        name_edit = QLineEdit()
+        name_edit.setPlaceholderText("Item name")
+        name_edit.setStyleSheet("background-color: #232323; border: 1px solid #333; border-radius: 3px; padding: 5px;")
+        right.addWidget(name_edit)
+
+        chosen = {"path": None}
+
+        def pick_image():
+            path, _ = QFileDialog.getOpenFileName(
+                dialog, "Choose Item Image", "", "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp)")
+            if path:
+                chosen["path"] = path
+                preview.setPixmap(QPixmap(path).scaled(
+                    60, 60, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
+        btn_img = QPushButton("Choose Image…")
+        btn_img.setStyleSheet(
+            "QPushButton { background-color: #2a3a4a; color: #88bbff; border-radius: 3px; padding: 5px; border: none; }"
+            "QPushButton:hover { background-color: #33506e; color: white; }")
+        btn_img.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_img.clicked.connect(pick_image)
+        right.addWidget(btn_img)
+        form.addLayout(right)
+        outer.addLayout(form)
+
+        lbl = QLabel("Dropped by (tick every boss that drops it):")
+        lbl.setStyleSheet("color: #e67e22; font-size: 12px; font-weight: bold; padding-top: 6px;")
+        outer.addWidget(lbl)
+
+        boss_scroll = QScrollArea()
+        boss_scroll.setWidgetResizable(True)
+        boss_scroll.setFixedHeight(200)
+        boss_scroll.setStyleSheet("background-color: #181818; border: 1px solid #2a2a2a; border-radius: 4px;")
+        boss_holder = QWidget()
+        boss_col = QVBoxLayout(boss_holder)
+        boss_col.setSpacing(2)
+        boxes = {}
+        for _path, key, display in _boss_files():
+            cb = QCheckBox(display)
+            cb.setStyleSheet("color: #cccccc; font-size: 12px;")
+            boxes[key] = cb
+            boss_col.addWidget(cb)
+        boss_col.addStretch()
+        boss_scroll.setWidget(boss_holder)
+        outer.addWidget(boss_scroll)
+
+        existing = QListWidget()
+        existing.setStyleSheet("background-color: #181818; border: 1px solid #2a2a2a; border-radius: 4px;")
+        existing.setFixedHeight(90)
+
+        def refresh_existing():
+            existing.clear()
+            for it in self.custom_items:
+                names = [d for _p, k, d in _boss_files() if k in it.get("bosses", [])]
+                existing.addItem(f"{it['name']}  —  {', '.join(names) if names else 'no boss'}")
+
+        refresh_existing()
+        outer.addWidget(QLabel("Your custom items:"))
+        outer.addWidget(existing)
+
+        def remove_selected():
+            row = existing.currentRow()
+            if row < 0 or row >= len(self.custom_items):
+                return
+            item = self.custom_items[row]
+            if QMessageBox.question(dialog, "Remove Item",
+                                    f"Remove \"{item['name']}\"?\n\nIts image file stays in the assets folder.",
+                                    ) != QMessageBox.StandardButton.Yes:
+                return
+            self.custom_items.pop(row)
+            self._apply_custom_items()
+            self.save_data()
+            refresh_existing()
+
+        btn_remove = QPushButton("Remove Selected")
+        btn_remove.setStyleSheet(
+            "QPushButton { background-color: #5a1a1a; color: #ff6666; border-radius: 3px; padding: 4px 8px; border: none; }"
+            "QPushButton:hover { background-color: #7b2222; color: white; }")
+        btn_remove.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_remove.clicked.connect(remove_selected)
+        outer.addWidget(btn_remove)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Close)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Add Item")
+        outer.addWidget(buttons)
+        buttons.rejected.connect(dialog.reject)
+
+        def commit():
+            name = name_edit.text().strip()
+            bosses = [k for k, cb in boxes.items() if cb.isChecked()]
+            if not name:
+                QMessageBox.warning(dialog, "Missing Name", "Give the item a name.")
+                return
+            if not chosen["path"]:
+                QMessageBox.warning(dialog, "Missing Image", "Choose an image for the item.")
+                return
+            if not bosses:
+                QMessageBox.warning(dialog, "No Boss", "Tick at least one boss that drops this item.")
+                return
+            dest_name = f"{name}.png"
+            dest = os.path.join(ITEMS_ASSETS_DIR, dest_name)
+            if os.path.exists(dest):
+                QMessageBox.warning(dialog, "Name Taken",
+                                    f"An item image named \"{dest_name}\" already exists. Pick another name.")
+                return
+            try:
+                Image.open(chosen["path"]).convert("RGBA").save(dest)
+            except (OSError, ValueError) as e:
+                QMessageBox.critical(dialog, "Image Error", f"Could not read that image:\n{e}")
+                return
+
+            self.custom_items.append({"name": name, "file": dest_name, "bosses": bosses})
+            _scaled_pixmap.cache_clear()
+            self._apply_custom_items()
+            self.save_data()
+            self.update_overview_calendar()
+            refresh_existing()
+            name_edit.clear()
+            chosen["path"] = None
+            preview.setPixmap(QPixmap())
+            preview.setText("no\nimage")
+            for cb in boxes.values():
+                cb.setChecked(False)
+
+        buttons.accepted.connect(commit)
+        dialog.exec()
 
     def _auto_populate_new_week(self):
         current_week_key = self.actual_current_week_key
@@ -1682,9 +1924,21 @@ class BossTrackerApp(QMainWindow):
         right_panel.setStyleSheet("background-color: #181818; border: 1px solid #232323; border-radius: 6px;")
         panel_layout = QVBoxLayout(right_panel)
 
+        tray_head = QHBoxLayout()
         lbl_tray = QLabel("Item Inventory")
         lbl_tray.setStyleSheet("color: #e67e22; font-size: 14px; font-weight: bold; padding: 2px;")
-        panel_layout.addWidget(lbl_tray)
+        tray_head.addWidget(lbl_tray)
+        tray_head.addStretch()
+        btn_custom = QPushButton("＋ Custom")
+        btn_custom.setToolTip("Add your own item with an image and the bosses that drop it")
+        btn_custom.setStyleSheet(
+            "QPushButton { background-color: #1a4a2a; color: #2ecc71; border-radius: 3px;"
+            " padding: 3px 8px; font-size: 11px; border: none; }"
+            "QPushButton:hover { background-color: #216b3c; color: white; }")
+        btn_custom.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_custom.clicked.connect(self.add_custom_item_dialog)
+        tray_head.addWidget(btn_custom)
+        panel_layout.addLayout(tray_head)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1694,46 +1948,7 @@ class BossTrackerApp(QMainWindow):
         self.items_shelf_layout.setSpacing(6)
         self.items_shelf_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
-        if os.path.exists(ITEMS_ASSETS_DIR):
-            all_items = [
-                (os.path.splitext(f)[0], f)
-                for f in sorted(os.listdir(ITEMS_ASSETS_DIR))
-                if f.lower().endswith('.png')
-            ]
-            known_names = {name for cat, _, names in ITEM_CATEGORIES[:-1] for name in names}
-            buckets = {cat: [] for cat, _, _ in ITEM_CATEGORIES}
-            for name, file in all_items:
-                name_lower = name.lower()
-                placed = False
-                for cat, _, names in ITEM_CATEGORIES[:-1]:
-                    if name_lower in names:
-                        buckets[cat].append((name, file))
-                        placed = True
-                        break
-                if not placed:
-                    buckets["Others"].append((name, file))
-
-            row_idx = 0
-            for cat, color, _ in ITEM_CATEGORIES:
-                items = buckets[cat]
-                if not items:
-                    continue
-                sep = QLabel(cat)
-                sep.setStyleSheet(
-                    f"color: {color}; font-size: 11px; font-weight: bold;"
-                    " padding: 4px 2px 2px 4px; background: transparent;")
-                self.items_shelf_layout.addWidget(sep, row_idx, 0, 1, 3)
-                row_idx += 1
-                col_idx = 0
-                for name, file in items:
-                    item_widget = DraggableAssetItem(name, os.path.join(ITEMS_ASSETS_DIR, file))
-                    self.items_shelf_layout.addWidget(item_widget, row_idx, col_idx)
-                    col_idx += 1
-                    if col_idx >= 3:
-                        col_idx = 0
-                        row_idx += 1
-                if col_idx != 0:
-                    row_idx += 1
+        self._populate_items_shelf()
 
         tray_widget = QWidget()
         tray_widget.setLayout(self.items_shelf_layout)
