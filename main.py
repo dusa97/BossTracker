@@ -37,7 +37,7 @@ SOURCES_ASSETS_DIR = os.path.join(_BASE_DIR, "sources")
 DATA_FILE        = os.path.join(_BASE_DIR, "boss_tracker_data.json")
 _BM_PATH = os.path.join(BOSS_ASSETS_DIR, "BlackMage.png")
 NUM_WEEKS_TO_SHOW = 4
-APP_VERSION = "v1.28"
+APP_VERSION = "v1.29"
 
 # Item Scanner (F9 tooltip capture/OCR) is built but hidden from the UI for now — flip to True
 # to bring back the tab and the F9 global hotkey. Nothing else needs to change.
@@ -73,7 +73,7 @@ BOSS_DIFFICULTY_MAP = {
     "first adversary": {"Easy": 985_000_000, "Normal": 1_365_000_000, "Hard": 2_940_000_000, "Extreme": 5_880_000_000},
     "guardian angel slime": {"Normal": 231_673_500, "Chaos": 654_578_125},
     "malefic star": {"Normal": 1_452_000_000, "Hard": 3_990_000_000},
-    "jupiter":   {"Normal": 2_965_000_000},
+    "jupiter":   {"Normal": 2_965_000_000, "Hard": 5_953_000_000},
 }
 
 MONTHLY_BOSSES = {"blackmage"}
@@ -173,6 +173,7 @@ BOSS_DROPS = {
     ("malefic star", "Normal"):     ["Grindstone of Life"],
     ("malefic star", "Hard"):       ["Grindstone of Faith", "Eternal Armor Box (Kalos)", "Life Boss Ring Box", "Blissful Nightmare"],
     ("jupiter", "Normal"):          ["Grindstone of Faith"],
+    ("jupiter", "Hard"):            ["Grindstone of Faith", "Eternal Armor Box (Limbo)", "Life Boss Ring Box", "Original Sin of Pride"],
 }
 
 # Pristine copy of the built-in drop table. Custom items are merged on top of this each
@@ -2398,6 +2399,21 @@ class BossTrackerApp(QMainWindow):
         layout.addWidget(title)
 
         versions = [
+            ("v1.29", "2026-09-23", [
+                "Added Hard Jupiter (5,953,000,000 crystal meso), dropping Grindstone of Faith, Eternal Armor Box (Limbo), Life Boss Ring Box and the new Original Sin of Pride. Normal Jupiter is unchanged and still drops Grindstone of Faith only.",
+                "Replaced Jupiter's boss icon with its in-game portrait.",
+            ]),
+            ("v1.28", "2026-09-23", [
+                "Added '+ Custom' next to the Item Inventory: add your own item with a name, an image and a tick list of the bosses that drop it — one item can be tied to several bosses. Custom items show up in drop-rate statistics, the boss totals table and the drop-source picker exactly like built-in ones, and can be removed again from the same dialog.",
+                "The Eternal gear pieces no longer crowd the Item Inventory — only the two Eternal Armor Boxes are listed. The files are untouched, so icons already placed on a calendar still show.",
+                "Removed the white inventory-tile background from DayBreak, Slime Ring, Mitra Rage, Blissful Nightmare, both Eternal Armor Boxes and Life Boss Ring Box.",
+            ]),
+            ("v1.27", "2026-09-22", [
+                "Changing a boss's difficulty or party size, or removing it, in a past week now asks first whether the change applies to that week only or to every week through today. Previously it always silently carried forward. Current and future weeks are unaffected and never ask.",
+            ]),
+            ("v1.26", "2026-09-15", [
+                "Internal cleanup: boss icons and the boss file listing are now cached, so redrawing the calendar does less work.",
+            ]),
             ("v1.25", "2026-08-22", [
                 "Added an 'Item Scanner' tab: press F9 anywhere (e.g. while hovering an item's tooltip in-game) to capture the screen instantly, without needing to move the mouse off the item first — the old flow required clicking a button, which meant the tooltip was already gone by the time the screenshot happened.",
                 "The captured screenshot is auto-scanned for the tooltip's region near the cursor and cropped automatically; when it isn't confident, it falls back to letting you drag a box manually over the (already frozen) screenshot.",
