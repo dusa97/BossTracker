@@ -17,7 +17,7 @@ from PyQt6.QtCore import (
     Qt, QMimeData, QTimer, QPoint, QEvent, QRect, QSize, QThread, pyqtSignal,
     QBuffer, QIODevice,
 )
-from PyQt6.QtGui import QDrag, QPixmap, QPainter, QColor, QIcon, QLinearGradient, QFont
+from PyQt6.QtGui import QDrag, QPixmap, QPainter, QColor, QIcon, QLinearGradient, QFont, QPen
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QScrollArea, QFrame, QPushButton, QInputDialog,
@@ -37,7 +37,7 @@ SOURCES_ASSETS_DIR = os.path.join(_BASE_DIR, "sources")
 DATA_FILE        = os.path.join(_BASE_DIR, "boss_tracker_data.json")
 _BM_PATH = os.path.join(BOSS_ASSETS_DIR, "BlackMage.png")
 NUM_WEEKS_TO_SHOW = 4
-APP_VERSION = "v1.31"
+APP_VERSION = "v1.32"
 
 # Item Scanner (F9 tooltip capture/OCR) is built but hidden from the UI for now — flip to True
 # to bring back the tab and the F9 global hotkey. Nothing else needs to change.
@@ -221,6 +221,15 @@ def _fmt_meso_short(n):
     if n >= 1_000_000:
         return f"{n / 1_000_000:.1f}M"
     return f"{n:,}"
+
+
+def _item_category(item_name):
+    """Inventory category (Pitched / Dawn / Brilliant / Others) for an item display name."""
+    name_lower = item_name.lower()
+    for cat, _color, names in ITEM_CATEGORIES[:-1]:
+        if name_lower in names:
+            return cat
+    return "Others"
 
 
 @functools.lru_cache(maxsize=None)
@@ -663,7 +672,7 @@ class CharacterProfileCard(QFrame):
                  move_up_callback=None, move_down_callback=None, hover_callback=None,
                  toggle_meso_cb=None, reorder_cb=None, is_completed=False, complete_cb=None,
                  task_summary=None, blackmage_done=False, blackmage_difficulty=None,
-                 blackmage_click_cb=None, blackmage_edit_cb=None):
+                 blackmage_click_cb=None, blackmage_edit_cb=None, drop_rate=None, drop_rate_cb=None):
         super().__init__()
         self.char_id = char_data["id"]
         self.click_callback = click_callback
@@ -760,6 +769,16 @@ class CharacterProfileCard(QFrame):
             btn_down.clicked.connect(lambda: move_down_callback(self.char_id))
         order_row.addWidget(btn_down)
 
+        btn_dr = QPushButton(f"DR {drop_rate}%" if drop_rate is not None else "DR —")
+        btn_dr.setToolTip("Item drop rate % — used by Statistics → Drop Rate Brackets")
+        btn_dr.setStyleSheet(
+            "QPushButton { background-color: #2a3a2a; color: #88cc88; border-radius: 3px; padding: 2px 6px; font-size: 11px; border: none; }"
+            "QPushButton:hover { background-color: #3a4a3a; color: white; }")
+        btn_dr.setCursor(Qt.CursorShape.PointingHandCursor)
+        if drop_rate_cb:
+            btn_dr.clicked.connect(lambda: drop_rate_cb(self.char_id))
+        order_row.addWidget(btn_dr)
+
         layout.addLayout(order_row)
 
         done_row = QHBoxLayout()
@@ -846,9 +865,14 @@ class CharacterProfileCard(QFrame):
 
 
 class MesoBarChart(QWidget):
-    def __init__(self, parent=None):
+    """Bar chart. Optional `fmt` formats value labels; optional `ref_line` draws a dashed
+    reference line at that value and colors bars green above it / red below it."""
+    def __init__(self, parent=None, fmt=None, ref_line=None):
         super().__init__(parent)
         self._data = []
+        self._ref = ref_line
+        if fmt is not None:
+            self._fmt = fmt
         self.setMinimumHeight(120)
 
     def set_data(self, data):
@@ -871,7 +895,7 @@ class MesoBarChart(QWidget):
         cw = W - ml - mr
         ch = H - mt - mb
         n = len(self._data)
-        max_val = max(v for _, v in self._data) or 1
+        max_val = max([v for _, v in self._data] + ([self._ref * 1.1] if self._ref else [])) or 1
 
         slot_w = cw / n
         bar_w = slot_w * 0.55
@@ -884,15 +908,19 @@ class MesoBarChart(QWidget):
             bh = (val / max_val) * ch
             y = mt + ch - bh
 
+            if self._ref is None:
+                top, bottom = "#f0c040", "#c0782a"
+            else:
+                top, bottom = ("#2ecc71", "#1e8449") if val >= self._ref else ("#ff6666", "#a02828")
             grad = QLinearGradient(x, y, x, y + bh)
-            grad.setColorAt(0, QColor("#f0c040"))
-            grad.setColorAt(1, QColor("#c0782a"))
+            grad.setColorAt(0, QColor(top))
+            grad.setColorAt(1, QColor(bottom))
             painter.setBrush(grad)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawRoundedRect(int(x), int(y), int(bar_w), int(bh) + 1, 3, 3)
 
             painter.setFont(f_val)
-            painter.setPen(QColor("#f0c040"))
+            painter.setPen(QColor(top))
             painter.drawText(int(x - 4), int(y) - 16, int(bar_w + 8), 16,
                              Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom, self._fmt(val))
 
@@ -900,6 +928,15 @@ class MesoBarChart(QWidget):
             painter.setPen(QColor("#b3b3b3"))
             painter.drawText(int(x - 4), mt + ch + 4, int(bar_w + 8), mb - 4,
                              Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, label)
+
+        if self._ref is not None:
+            ry = int(mt + ch - (self._ref / max_val) * ch)
+            pen = QPen(QColor("#888888"))
+            pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.drawLine(ml, ry, W - mr, ry)
+            painter.setFont(f_lbl)
+            painter.drawText(ml + 2, ry - 3, f"average ({self._fmt(self._ref)})")
 
         painter.end()
 
@@ -1221,6 +1258,7 @@ class BossTrackerApp(QMainWindow):
         self._pitched_expanded = set()
         self._pitched_log_expanded = set()
         self.char_exclusion_history = {}
+        self.char_drop_rate_history = {}
         self._all_tasks_update_in_progress = False
         self._task_drag_state = None
         self.tasks_sort_mode = "manual"
@@ -1327,6 +1365,7 @@ class BossTrackerApp(QMainWindow):
             "char_pitched_tracker": {str(k): v for k, v in self.char_pitched_tracker.items()},
             "pitched_tracked_chars": self.pitched_tracked_chars,
             "char_exclusion_history": {str(k): v for k, v in self.char_exclusion_history.items()},
+            "char_drop_rate_history": {str(k): v for k, v in self.char_drop_rate_history.items()},
             "saved_item_drops": {
                 f"{k[0]}|{k[1]}": v for k, v in self.saved_item_drops.items()
             },
@@ -1388,6 +1427,7 @@ class BossTrackerApp(QMainWindow):
                 # First load under the opt-in system: keep whoever already had real data tracked.
                 self.pitched_tracked_chars = [cid for cid, items in self.char_pitched_tracker.items() if items]
             self.char_exclusion_history = {int(k): v for k, v in data.get("char_exclusion_history", {}).items()}
+            self.char_drop_rate_history = {int(k): v for k, v in data.get("char_drop_rate_history", {}).items()}
             global LABEL_FONT_SIZE
             LABEL_FONT_SIZE = data.get("label_font_size", 11)
             self._backfill_missing_dates()
@@ -2377,6 +2417,72 @@ class BossTrackerApp(QMainWindow):
         clears_scroll.setWidget(clears_content)
         tab_widget.addTab(clears_scroll, "Boss Clears")
 
+        # ── Tab 3: Drop Rate Brackets ───────────────────────────────────
+        dr_content = QWidget()
+        dr_content.setStyleSheet("background-color: #121212;")
+        dr_layout = QVBoxLayout(dr_content)
+        dr_layout.setContentsMargins(20, 15, 20, 20)
+        dr_layout.setSpacing(12)
+        lbl_dr = QLabel("Item Drop Rates by Character Drop Rate % (brackets of 20)")
+        lbl_dr.setStyleSheet("color: #e67e22; font-size: 15px; font-weight: bold;")
+        dr_layout.addWidget(lbl_dr)
+        hint_dr = QLabel("Each cell: % of clears that dropped the item, for weeks the character's drop rate was in "
+                         "that bracket. Change = highest bracket minus lowest bracket, counting only brackets that got at "
+                         "least one drop (percentage points). Hover a Change cell to see which two were compared.")
+        hint_dr.setStyleSheet("color: #888888; font-size: 11px;")
+        hint_dr.setWordWrap(True)
+        dr_layout.addWidget(hint_dr)
+        self.dr_members_label = QLabel("")
+        self.dr_members_label.setStyleSheet("color: #cccccc; font-size: 12px;")
+        self.dr_members_label.setWordWrap(True)
+        dr_layout.addWidget(self.dr_members_label)
+        dr_filter_widget, self.dr_cat_cbs = self._make_cat_filter_row()
+        dr_layout.addWidget(dr_filter_widget)
+
+        lbl_per_item = QLabel("Per Item")
+        lbl_per_item.setStyleSheet("color: #e67e22; font-size: 14px; font-weight: bold;")
+        dr_layout.addWidget(lbl_per_item)
+        self.dr_brackets_table = QTableWidget(0, 0)
+        self.dr_brackets_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.dr_brackets_table.verticalHeader().setVisible(False)
+        self.dr_brackets_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.dr_brackets_table.setStyleSheet(table_style)
+        self.dr_brackets_table.horizontalHeader().setSectionsClickable(True)
+        self.dr_brackets_table.setMinimumHeight(420)
+        dr_layout.addWidget(self.dr_brackets_table, stretch=1)
+
+        self.dr_overall_title = QLabel("Overall Luck by Drop Rate")
+        self.dr_overall_title.setStyleSheet("color: #e67e22; font-size: 14px; font-weight: bold; padding-top: 8px;")
+        dr_layout.addWidget(self.dr_overall_title)
+        hint_overall = QLabel("Uses the same Pitched / Dawn / Brilliant / Others checkboxes as the table above. "
+                              "Each bar = actual drops ÷ expected drops in that bracket. Expected uses each item's own "
+                              "average drop rate across all brackets, so brackets that farmed different bosses still "
+                              "compare fairly. 100% = your average; green above, red below.")
+        hint_overall.setStyleSheet("color: #888888; font-size: 11px;")
+        hint_overall.setWordWrap(True)
+        dr_layout.addWidget(hint_overall)
+        self.dr_overall_chart = MesoBarChart(fmt=lambda v: f"{v:.0f}%", ref_line=100)
+        self.dr_overall_chart.setFixedHeight(220)
+        dr_layout.addWidget(self.dr_overall_chart)
+        self.dr_overall_table = QTableWidget(0, 4)
+        self.dr_overall_table.setHorizontalHeaderLabels(["Bracket", "Drops", "Expected", "Luck vs average"])
+        self.dr_overall_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.dr_overall_table.verticalHeader().setVisible(False)
+        self.dr_overall_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.dr_overall_table.setStyleSheet(table_style)
+        dr_layout.addWidget(self.dr_overall_table)
+
+        def _on_dr_filter(_):
+            self._apply_drop_filter(self.dr_brackets_table, self.dr_cat_cbs)
+            self._refresh_dr_overall()
+        for _cb in self.dr_cat_cbs.values():
+            _cb.stateChanged.connect(_on_dr_filter)
+        dr_scroll = QScrollArea()
+        dr_scroll.setWidgetResizable(True)
+        dr_scroll.setStyleSheet("background: transparent; border: none;")
+        dr_scroll.setWidget(dr_content)
+        tab_widget.addTab(dr_scroll, "Drop Rate Brackets")
+
         root = QVBoxLayout(page)
         root.setContentsMargins(0, 0, 0, 0)
         root.addWidget(tab_widget)
@@ -2402,6 +2508,11 @@ class BossTrackerApp(QMainWindow):
         layout.addWidget(title)
 
         versions = [
+            ("v1.32", "2026-10-02", [
+                "Each character card now has a 'DR' button to set that character's item drop rate %. It's recorded per week, so raising it later doesn't relabel your earlier drops.",
+                "New Statistics → 'Drop Rate Brackets' tab: every item drop is compared across drop-rate brackets of 20 (0-20%, 21-40%, … 341-360%, 361-380% …), with a 'Change' column showing how much the drop rate moves between the lowest and highest bracket that got at least one drop (brackets with 0 drops are skipped; hover the cell to see which two were compared).",
+                "The Drop Rate Brackets tab also has an 'Overall Luck by Drop Rate' bar chart: for each bracket, actual drops ÷ expected drops across all items (100% = your average, green above / red below), with a table of the raw drop counts underneath. It follows the Pitched / Dawn / Brilliant / Others filters.",
+            ]),
             ("v1.31", "2026-09-23", [
                 "All five Brilliant items are now consistent everywhere. Immortal Legacy and Original Sin of Pride were missing from the Pitched Items '+ Add Item' list, so only three of the five could be tracked there.",
             ]),
@@ -2845,12 +2956,14 @@ class BossTrackerApp(QMainWindow):
                         grindstones += 1
         return boxes, grindstones
 
-    def _tally_boss_clears(self, char_ids):
+    def _tally_boss_clears(self, char_ids, bucket_of=None):
         """Walk every week from each boss's first stamp through today. Returns
         (boss_counts, boss_items, rates):
           boss_counts[(display, key, diff)] = clears
           boss_items[(display, key, diff)][item_stem] = copies obtained (state 0 only)
-          rates[(item_display, "Display (Diff)")] = (weeks_obtained, clears)"""
+          rates[(item_display, "Display (Diff)")] = (weeks_obtained, clears)
+        With bucket_of(cid, wkey) -> bucket, rates keys gain a third element (the bucket)
+        and weeks where it returns None are skipped."""
         boss_counts, boss_items, rates = {}, {}, {}
         for cid in char_ids:
             first_week = {}
@@ -2871,6 +2984,12 @@ class BossTrackerApp(QMainWindow):
                     state, _ = self.resolve_boss_state_at_week(cid, wkey, path)
                     if not state or state.get("is_deleted_marker", False):
                         continue
+                    extra = ()
+                    if bucket_of is not None:
+                        bucket = bucket_of(cid, wkey)
+                        if bucket is None:
+                            continue
+                        extra = (bucket,)
                     diff = state.get("difficulty", "Normal")
                     bkey = (raw, key, diff)
                     boss_counts[bkey] = boss_counts.get(bkey, 0) + 1
@@ -2891,9 +3010,109 @@ class BossTrackerApp(QMainWindow):
                                 bi[stem] = bi.get(stem, 0) + 1
                     label = f"{raw} ({diff})"
                     for stem, display in possible.items():
-                        ob, cl = rates.get((display, label), (0, 0))
-                        rates[(display, label)] = (ob + (stem in obtained), cl + 1)
+                        rk = (display, label) + extra
+                        ob, cl = rates.get(rk, (0, 0))
+                        rates[rk] = (ob + (stem in obtained), cl + 1)
         return boss_counts, boss_items, rates
+
+    def _fill_drop_rate_brackets(self):
+        """Rows = item drop, columns = drop-rate brackets, cell = rate % in that bracket."""
+        def bucket_of(cid, wkey):
+            rate = self._drop_rate_at_week(cid, wkey)
+            return None if rate is None else self._drop_rate_bracket(rate)
+
+        _, _, rates = self._tally_boss_clears([c["id"] for c in self.characters], bucket_of)
+        brackets = sorted({k[2] for k in rates})
+        self._dr_rates, self._dr_brackets = rates, brackets
+        self._refresh_dr_overall()
+
+        members = {}
+        for c in self.characters:
+            rate = self._drop_rate_at_week(c["id"], self.actual_current_week_key)
+            if rate is not None:
+                members.setdefault(self._drop_rate_bracket(rate), []).append(f"{c['name']} ({rate}%)")
+        lines = [f"<b>{b[1]}</b>: {', '.join(members.get(b, [])) or '(none now)'}" for b in brackets]
+        unset = [c["name"] for c in self.characters if c["id"] not in self.char_drop_rate_history]
+        if unset:
+            lines.append(f"<span style='color:#666666'>No drop rate set (not counted): {', '.join(unset)}</span>")
+        self.dr_members_label.setText("<br>".join(lines) if lines else
+                                      "Set a drop rate on a character card (DR button) to see brackets here.")
+
+        table = self.dr_brackets_table
+        table.setSortingEnabled(False)
+        table.clear()
+        table.setRowCount(0)
+        table.setColumnCount(len(brackets) + 3)
+        table.setHorizontalHeaderLabels(["Item", "Boss (Diff)"] + [b[1] for b in brackets] + ["Change"])
+        for row_key in sorted({k[:2] for k in rates}):
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, QTableWidgetItem(row_key[0]))
+            table.setItem(row, 1, QTableWidgetItem(row_key[1]))
+            with_drops = []  # (pct, bracket label) — brackets with 0 drops don't count toward Change
+            for col, b in enumerate(brackets, start=2):
+                ob, cl = rates.get(row_key + (b,), (0, 0))
+                if cl:
+                    pct = ob / cl * 100
+                    if ob:
+                        with_drops.append((pct, b[1]))
+                    table.setItem(row, col, _NumItem(pct, f"{pct:.1f}%  ({ob}/{cl})"))
+                else:
+                    table.setItem(row, col, _NumItem(-1.0, "—"))
+            if len(with_drops) >= 2:
+                (lo_pct, lo_lbl), (hi_pct, hi_lbl) = with_drops[0], with_drops[-1]
+                delta = hi_pct - lo_pct
+                cell = _NumItem(delta, f"{delta:+.1f} pts")
+                cell.setForeground(QColor("#2ecc71" if delta > 0 else "#ff6666" if delta < 0 else "#aaaaaa"))
+                cell.setToolTip(f"{hi_lbl}: {hi_pct:.1f}%  vs  {lo_lbl}: {lo_pct:.1f}%")
+            else:
+                cell = _NumItem(-1000.0, "—")
+                cell.setToolTip("Needs at least 2 brackets that actually got a drop")
+            table.setItem(row, len(brackets) + 2, cell)
+        table.setSortingEnabled(True)
+        self._apply_drop_filter(table, self.dr_cat_cbs)
+
+    @staticmethod
+    def _drop_rate_luck(rates, brackets, include_item=lambda name: True):
+        """Observed vs expected drops per bracket. Expected = clears in that bracket × the item's
+        own average rate across all brackets, summed over items. Returns
+        [(bracket, drops, expected)] for brackets with expected > 0."""
+        item_totals = {}
+        for (item, boss, _b), (ob, cl) in rates.items():
+            if include_item(item):
+                o, c = item_totals.get((item, boss), (0, 0))
+                item_totals[(item, boss)] = (o + ob, c + cl)
+        drops, expected = {}, {}
+        for (item, boss, b), (ob, cl) in rates.items():
+            if (item, boss) not in item_totals:
+                continue
+            tot_ob, tot_cl = item_totals[(item, boss)]
+            drops[b] = drops.get(b, 0) + ob
+            expected[b] = expected.get(b, 0.0) + cl * tot_ob / tot_cl
+        return [(b, drops[b], expected[b]) for b in brackets if expected.get(b, 0) > 0]
+
+    def _refresh_dr_overall(self):
+        visible = {cat for cat, cb in self.dr_cat_cbs.items() if cb.isChecked()}
+        shown = [cat for cat, _c, _n in ITEM_CATEGORIES if cat in visible]
+        self.dr_overall_title.setText("Overall Luck by Drop Rate — " + (
+            "all items" if len(shown) == len(ITEM_CATEGORIES) else " + ".join(shown) or "nothing selected"))
+        rows = self._drop_rate_luck(getattr(self, "_dr_rates", {}), getattr(self, "_dr_brackets", []),
+                                    lambda name: _item_category(name) in visible)
+        self.dr_overall_chart.set_data([(b[1], d / e * 100) for b, d, e in rows])
+        t = self.dr_overall_table
+        t.setRowCount(0)
+        for b, d, e in rows:
+            luck = d / e * 100
+            r = t.rowCount()
+            t.insertRow(r)
+            t.setItem(r, 0, QTableWidgetItem(b[1]))
+            t.setItem(r, 1, QTableWidgetItem(str(d)))
+            t.setItem(r, 2, QTableWidgetItem(f"{e:.1f}"))
+            cell = QTableWidgetItem(f"{luck:.0f}%  ({luck - 100:+.0f}%)")
+            cell.setForeground(QColor("#2ecc71" if luck >= 100 else "#ff6666"))
+            t.setItem(r, 3, cell)
+        t.setFixedHeight(t.horizontalHeader().sizeHint().height()
+                         + sum(t.rowHeight(r) for r in range(t.rowCount())) + 6)
 
     def _fill_boss_totals_table(self, table, boss_counts, boss_items):
         table.setSortingEnabled(False)
@@ -2957,15 +3176,8 @@ class BossTrackerApp(QMainWindow):
         visible = {cat for cat, cb in cat_cbs.items() if cb.isChecked()}
         for r in range(table.rowCount()):
             item = table.item(r, 0)
-            if item is None:
-                continue
-            name_lower = item.text().lower()
-            cat = "Others"
-            for c, _, names in ITEM_CATEGORIES[:-1]:
-                if name_lower in names:
-                    cat = c
-                    break
-            table.setRowHidden(r, cat not in visible)
+            if item is not None:
+                table.setRowHidden(r, _item_category(item.text()) not in visible)
 
     def handle_clear_all_bosses(self):
         if self.selected_char_id is None:
@@ -3106,6 +3318,7 @@ class BossTrackerApp(QMainWindow):
         boss_counts, boss_items, rates = self._tally_boss_clears([c["id"] for c in self.characters])
         self._fill_boss_totals_table(self.stats_boss_totals_table, boss_counts, boss_items)
         self._fill_drop_rates_table(self.stats_drop_rates_table, rates, self.stats_drop_cat_cbs)
+        self._fill_drop_rate_brackets()
 
         self.stats_grindstone_table.setRowCount(0)
         boxes_total = 0
@@ -3236,6 +3449,8 @@ class BossTrackerApp(QMainWindow):
                 blackmage_done=bm_done, blackmage_difficulty=bm_diff,
                 blackmage_click_cb=(lambda cid=char["id"]: self.toggle_blackmage_week(cid, self.actual_current_week_key)),
                 blackmage_edit_cb=(lambda cid=char["id"]: self.edit_blackmage_month(cid)),
+                drop_rate=self._drop_rate_at_week(char["id"], self.actual_current_week_key),
+                drop_rate_cb=self.set_char_drop_rate,
             ), row, 0)
             for col, w in enumerate(weeks, start=1):
                 cell = DynamicCalendarCell(char["id"], w["key"], w["is_current"], self.drop_loot_callback,
@@ -4244,6 +4459,39 @@ class BossTrackerApp(QMainWindow):
         if not relevant:
             return False
         return relevant[-1]["excluded"]
+
+    def _drop_rate_at_week(self, char_id, week_key):
+        """Drop rate % in effect that week, from recorded history. Weeks before the first
+        entry use the first recorded rate. None if never set."""
+        history = self.char_drop_rate_history.get(char_id)
+        if not history:
+            return None
+        relevant = [h for h in history if h["week_key"] <= week_key]
+        return (relevant[-1] if relevant else history[0])["rate"]
+
+    @staticmethod
+    def _drop_rate_bracket(rate):
+        """Bracket of 20: 0-20, 21-40, 41-60, … Returns (sort_key, label)."""
+        b = max(rate - 1, 0) // 20
+        return b, f"{0 if b == 0 else b * 20 + 1}-{(b + 1) * 20}%"
+
+    def set_char_drop_rate(self, char_id):
+        current = self._drop_rate_at_week(char_id, self.actual_current_week_key)
+        if current is None:
+            prompt = "Item drop rate %\n(first time: also counts for ALL your past weeks)"
+        else:
+            prompt = (f"Item drop rate %\n(applies from this week on — earlier weeks keep what they had, "
+                      f"currently {current}%)")
+        rate, ok = QInputDialog.getInt(self, "Drop Rate", prompt,
+                                       value=current if current is not None else 0, min=0, max=2000)
+        if not ok:
+            return
+        history = self.char_drop_rate_history.setdefault(char_id, [])
+        history[:] = [h for h in history if h["week_key"] != self.actual_current_week_key]
+        history.append({"week_key": self.actual_current_week_key, "rate": rate})
+        history.sort(key=lambda h: h["week_key"])
+        self.save_data()
+        self.update_overview_calendar()
 
     def toggle_meso_exclude(self, char_id):
         for c in self.characters:
@@ -6370,6 +6618,7 @@ class BossTrackerApp(QMainWindow):
         self.char_tasks.pop(char_id, None)
         self.char_item_results.pop(char_id, None)
         self.char_pitched_tracker.pop(char_id, None)
+        self.char_drop_rate_history.pop(char_id, None)
         if char_id in self.pitched_tracked_chars:
             self.pitched_tracked_chars.remove(char_id)
         self.char_completed_weeks = {k for k in self.char_completed_weeks if not k.startswith(f"{char_id}|")}
