@@ -36,8 +36,10 @@ BOSS_ASSETS_DIR   = os.path.join(_BASE_DIR, "boss")
 SOURCES_ASSETS_DIR = os.path.join(_BASE_DIR, "sources")
 DATA_FILE        = os.path.join(_BASE_DIR, "boss_tracker_data.json")
 _BM_PATH = os.path.join(BOSS_ASSETS_DIR, "BlackMage.png")
+_SEREN_PATH = os.path.join(BOSS_ASSETS_DIR, "Seren.png")
+SEREN_AUTO_COMPLETE_MAX_PARTY = 1  # Complete All / Mark Done only tick Seren off for parties this size or smaller
 NUM_WEEKS_TO_SHOW = 4
-APP_VERSION = "v1.32"
+APP_VERSION = "v1.33"
 
 # Item Scanner (F9 tooltip capture/OCR) is built but hidden from the UI for now — flip to True
 # to bring back the tab and the F9 global hotkey. Nothing else needs to change.
@@ -444,8 +446,9 @@ class ClickableCellIcon(QWidget):
 
 
 class BlackMageToggle(QLabel):
-    """Checkbox for the monthly Black Mage clear (no drag-and-drop)."""
-    def __init__(self, image_path, is_done, difficulty_text, click_cb, right_click_cb):
+    """Checkbox icon for a boss tracked on the Overview card (monthly Black Mage, weekly Seren)."""
+    def __init__(self, image_path, is_done, difficulty_text, click_cb, right_click_cb,
+                 done_tip=None, todo_tip=None, todo_style=None):
         super().__init__()
         self.click_cb = click_cb
         self.remove_cb = right_click_cb
@@ -456,8 +459,8 @@ class BlackMageToggle(QLabel):
         if is_done:
             self.setPixmap(base_pixmap)
             self.setStyleSheet("border: 2px solid #2ecc71; border-radius: 4px;")
-            self.setToolTip(f"Black Mage ({difficulty_text}) — Monthly\n"
-                             "Left-click: Uncheck\nRight-click: Edit difficulty / party size")
+            self.setToolTip(done_tip or (f"Black Mage ({difficulty_text}) — Monthly\n"
+                                         "Left-click: Uncheck\nRight-click: Edit difficulty / party size"))
         else:
             dim_pixmap = QPixmap(base_pixmap.size())
             dim_pixmap.fill(Qt.GlobalColor.transparent)
@@ -466,8 +469,8 @@ class BlackMageToggle(QLabel):
             painter.drawPixmap(0, 0, base_pixmap)
             painter.end()
             self.setPixmap(dim_pixmap)
-            self.setStyleSheet("border: 1px dashed #888888; border-radius: 4px;")
-            self.setToolTip("Black Mage (Monthly)\nClick to mark done this month")
+            self.setStyleSheet(todo_style or "border: 1px dashed #888888; border-radius: 4px;")
+            self.setToolTip(todo_tip or "Black Mage (Monthly)\nClick to mark done this month")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -672,7 +675,9 @@ class CharacterProfileCard(QFrame):
                  move_up_callback=None, move_down_callback=None, hover_callback=None,
                  toggle_meso_cb=None, reorder_cb=None, is_completed=False, complete_cb=None,
                  task_summary=None, blackmage_done=False, blackmage_difficulty=None,
-                 blackmage_click_cb=None, blackmage_edit_cb=None, drop_rate=None, drop_rate_cb=None):
+                 blackmage_click_cb=None, blackmage_edit_cb=None, drop_rate=None, drop_rate_cb=None,
+                 seren_state=None, seren_done=False, seren_click_cb=None,
+                 seren_auto=False, seren_auto_cb=None):
         super().__init__()
         self.char_id = char_data["id"]
         self.click_callback = click_callback
@@ -694,16 +699,20 @@ class CharacterProfileCard(QFrame):
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
-        name_row = QHBoxLayout()
-        name_row.setSpacing(6)
-        name_row.setContentsMargins(0, 0, 0, 0)
-
         name_lbl = QLabel(char_data["name"])
         name_color = "#666666" if is_excluded else "#ffffff"
         name_lbl.setStyleSheet(
-            f"font-weight: bold; color: {name_color}; font-size: 14px; background: transparent; border:none;")
+            f"font-weight: bold; color: {name_color}; font-size: 15px; background: transparent; border:none;")
+        name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        name_lbl.setToolTip(char_data["name"])
         name_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        name_row.addWidget(name_lbl)
+        layout.addWidget(name_lbl)
+
+        # Boss checkmarks (Black Mage, Seren) get their own row so they never squeeze the name.
+        name_row = QHBoxLayout()
+        name_row.setSpacing(8)
+        name_row.setContentsMargins(0, 0, 0, 0)
+        name_row.addStretch()
 
         if blackmage_click_cb is not None:
             if os.path.exists(_BM_PATH):
@@ -711,6 +720,24 @@ class CharacterProfileCard(QFrame):
                                             click_cb=blackmage_click_cb,
                                             right_click_cb=blackmage_edit_cb or (lambda: None))
                 name_row.addWidget(bm_toggle)
+
+        if seren_state is not None and seren_click_cb is not None and os.path.exists(_SEREN_PATH):
+            diff, party = seren_state.get("difficulty", "?"), seren_state.get("party_size", 1)
+            who = "solo" if party == 1 else f"{party} people"
+            if seren_auto:
+                rule = ("\nSkip ON: 'Complete All' / 'Mark Done' check this off even in a party."
+                        "\nRight-click: undo skip")
+            elif party > SEREN_AUTO_COMPLETE_MAX_PARTY:
+                rule = ("\nParty run: 'Complete All' / 'Mark Done' leave this for you to click."
+                        "\nRight-click: skip this step for this character")
+            else:
+                rule = "\n'Complete All' / 'Mark Done' also check this off.\nRight-click: skip this step for this character"
+            name_row.addWidget(BlackMageToggle(
+                _SEREN_PATH, seren_done, diff, click_cb=seren_click_cb,
+                right_click_cb=seren_auto_cb or (lambda: None),
+                done_tip=f"Seren ({diff}, {who}) — Weekly\nDone this week. Left-click: Uncheck{rule}",
+                todo_tip=f"Seren ({diff}, {who}) — Weekly\nLeft-click: mark done this week{rule}",
+                todo_style="border: 1px dashed #3498db; border-radius: 4px;" if seren_auto else None))
 
         name_row.addStretch()
         layout.addLayout(name_row)
@@ -780,6 +807,24 @@ class CharacterProfileCard(QFrame):
         order_row.addWidget(btn_dr)
 
         layout.addLayout(order_row)
+
+        if (seren_state is not None and seren_auto_cb is not None
+                and (seren_auto or seren_state.get("party_size", 1) > SEREN_AUTO_COMPLETE_MAX_PARTY)):
+            btn_seren_skip = QPushButton("Undo Seren skip" if seren_auto else "Skip Seren click")
+            btn_seren_skip.setToolTip(
+                "Seren skip is ON: 'Complete All' / 'Mark Done' tick this party Seren automatically.\nClick to undo."
+                if seren_auto else
+                "Seren is a party run, so 'Complete All' / 'Mark Done' leave it for you to click.\n"
+                "Click to skip that step: tick it automatically for this character from now on.")
+            btn_seren_skip.setStyleSheet(
+                ("QPushButton { background-color: #1a2a3a; color: #3498db; border: 1px solid #3498db;"
+                 if seren_auto else
+                 "QPushButton { background-color: #2a2a2a; color: #888888; border: 1px solid #3a3a3a;")
+                + " border-radius: 3px; padding: 2px 6px; font-size: 10px; }"
+                  "QPushButton:hover { background-color: #253545; color: white; }")
+            btn_seren_skip.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_seren_skip.clicked.connect(lambda: seren_auto_cb())
+            layout.addWidget(btn_seren_skip)
 
         done_row = QHBoxLayout()
         done_row.setSpacing(4)
@@ -877,6 +922,10 @@ class MesoBarChart(QWidget):
 
     def set_data(self, data):
         self._data = data
+        self.update()
+
+    def set_ref_line(self, value):
+        self._ref = value
         self.update()
 
     def paintEvent(self, event):
@@ -1250,6 +1299,7 @@ class BossTrackerApp(QMainWindow):
         self._resolve_cache = {}
         self._stats_dirty = True
         self.char_completed_weeks = set()
+        self.seren_completed_weeks = set()
         self.char_tasks = {}
         self.global_tasks = []
         self.char_item_results = {}
@@ -1359,6 +1409,7 @@ class BossTrackerApp(QMainWindow):
             "last_seen_week": self.actual_current_week_key,
             "label_font_size": LABEL_FONT_SIZE,
             "char_completed_weeks": list(self.char_completed_weeks),
+            "seren_completed_weeks": sorted(self.seren_completed_weeks),
             "char_tasks": {str(k): v for k, v in self.char_tasks.items()},
             "global_tasks": self.global_tasks,
             "char_item_results": {str(k): v for k, v in self.char_item_results.items()},
@@ -1400,6 +1451,7 @@ class BossTrackerApp(QMainWindow):
             }
             self._loaded_last_seen_week = data.get("last_seen_week", "")
             self.char_completed_weeks = set(data.get("char_completed_weeks", []))
+            self.seren_completed_weeks = set(data.get("seren_completed_weeks", []))
             self.char_tasks = {int(k): v for k, v in data.get("char_tasks", {}).items()}
             self.global_tasks = data.get("global_tasks", [])
             self.char_item_results = {int(k): v for k, v in data.get("char_item_results", {}).items()}
@@ -2472,6 +2524,46 @@ class BossTrackerApp(QMainWindow):
         self.dr_overall_table.setStyleSheet(table_style)
         dr_layout.addWidget(self.dr_overall_table)
 
+        lbl_item_cmp = QLabel("Compare a Specific Drop")
+        lbl_item_cmp.setStyleSheet("color: #e67e22; font-size: 14px; font-weight: bold; padding-top: 8px;")
+        dr_layout.addWidget(lbl_item_cmp)
+        hint_item_cmp = QLabel("Pick one item (or one item across all bosses that drop it) and tick the drop-rate "
+                               "brackets to compare. Bars = that item's real drop % in each bracket; dashed line = its "
+                               "average over the ticked brackets.")
+        hint_item_cmp.setStyleSheet("color: #888888; font-size: 11px;")
+        hint_item_cmp.setWordWrap(True)
+        dr_layout.addWidget(hint_item_cmp)
+        self.dr_item_combo = QComboBox()
+        self.dr_item_combo.setMinimumWidth(360)
+        self.dr_item_combo.setStyleSheet(
+            "QComboBox { background-color: #2a2a2a; color: white; border: 1px solid #3a3a3a;"
+            " border-radius: 4px; padding: 3px 8px; font-size: 12px; }"
+            "QComboBox QAbstractItemView { background-color: #2a2a2a; color: white;"
+            " selection-background-color: #3a4a5a; }")
+        self.dr_item_combo.currentIndexChanged.connect(lambda _: self._refresh_dr_item())
+        item_row = QHBoxLayout()
+        lbl_item = QLabel("Item:")
+        lbl_item.setStyleSheet("color: #aaaaaa; font-size: 12px;")
+        item_row.addWidget(lbl_item)
+        item_row.addWidget(self.dr_item_combo)
+        item_row.addStretch()
+        dr_layout.addLayout(item_row)
+        self.dr_bracket_cb_row = QHBoxLayout()
+        self.dr_bracket_cb_row.setSpacing(12)
+        self._dr_bracket_cbs = {}
+        self._dr_unticked_brackets = set()
+        dr_layout.addLayout(self.dr_bracket_cb_row)
+        self.dr_item_chart = MesoBarChart(fmt=lambda v: f"{v:.1f}%", ref_line=0)
+        self.dr_item_chart.setFixedHeight(220)
+        dr_layout.addWidget(self.dr_item_chart)
+        self.dr_item_table = QTableWidget(0, 5)
+        self.dr_item_table.setHorizontalHeaderLabels(["Bracket", "Drops", "Clears", "Drop %", "vs average"])
+        self.dr_item_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.dr_item_table.verticalHeader().setVisible(False)
+        self.dr_item_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.dr_item_table.setStyleSheet(table_style)
+        dr_layout.addWidget(self.dr_item_table)
+
         def _on_dr_filter(_):
             self._apply_drop_filter(self.dr_brackets_table, self.dr_cat_cbs)
             self._refresh_dr_overall()
@@ -2508,11 +2600,18 @@ class BossTrackerApp(QMainWindow):
         layout.addWidget(title)
 
         versions = [
+            ("v1.33", "2026-10-10", [
+                "Seren now has its own checkmark icon on each character card (next to Black Mage), shown whenever Seren is on that character's schedule this week. Click it to mark Seren done; it resets every week.",
+                "'Complete All' and a card's 'Mark Done' also tick Seren off — but only when Seren is run solo (1 person). With 2+ people it stays open until you click the Seren icon yourself.",
+                "This week's Seren crystal now counts toward the meso and 'Crystals sold' totals only once its checkmark is ticked — like Black Mage, it counts even before the character is marked Done, and a party Seren that isn't ticked doesn't count yet. Past weeks are unaffected.",
+                "Un-marking a character's Done also unticks their Seren when it was the automatic kind (solo, or skip ON); a party Seren you ticked yourself stays ticked.",
+                "Party-Seren characters get a 'Skip Seren click' button on their card (or right-click the Seren icon) to skip that manual step for them: Complete All / Mark Done will then tick Seren off even in a party (blue dashed border while it's on). Click 'Undo Seren skip' (or right-click again) to undo.",
+                "New 'Compare a Specific Drop' section at the bottom of Statistics → Drop Rate Brackets: pick one item (or one item across all bosses that drop it) and tick which drop-rate brackets to compare — shows that item's real drop % per bracket against its average over the ticked brackets.",
+            ]),
             ("v1.32", "2026-10-02", [
                 "Each character card now has a 'DR' button to set that character's item drop rate %. It's recorded per week, so raising it later doesn't relabel your earlier drops.",
                 "New Statistics → 'Drop Rate Brackets' tab: every item drop is compared across drop-rate brackets of 20 (0-20%, 21-40%, … 341-360%, 361-380% …), with a 'Change' column showing how much the drop rate moves between the lowest and highest bracket that got at least one drop (brackets with 0 drops are skipped; hover the cell to see which two were compared).",
-                "The Drop Rate Brackets tab also has an 'Overall Luck by Drop Rate' bar chart: for each bracket, actual drops ÷ expected drops across all items (100% = your average, green above / red below), with a table of the raw drop counts underneath. It follows the Pitched / Dawn / Brilliant / Others filters.",
-            ]),
+                "The Drop Rate Brackets tab also has an 'Overall Luck by Drop Rate' bar chart: for each bracket, actual drops ÷ expected drops across all items (100% = your average, green above / red below), with a table of the raw drop counts underneath. It follows the Pitched / Dawn / Brilliant / Others filters.",            ]),
             ("v1.31", "2026-09-23", [
                 "All five Brilliant items are now consistent everywhere. Immortal Legacy and Original Sin of Pride were missing from the Pitched Items '+ Add Item' list, so only three of the five could be tracked there.",
             ]),
@@ -3025,6 +3124,7 @@ class BossTrackerApp(QMainWindow):
         brackets = sorted({k[2] for k in rates})
         self._dr_rates, self._dr_brackets = rates, brackets
         self._refresh_dr_overall()
+        self._rebuild_dr_item_controls()
 
         members = {}
         for c in self.characters:
@@ -3090,6 +3190,84 @@ class BossTrackerApp(QMainWindow):
             drops[b] = drops.get(b, 0) + ob
             expected[b] = expected.get(b, 0.0) + cl * tot_ob / tot_cl
         return [(b, drops[b], expected[b]) for b in brackets if expected.get(b, 0) > 0]
+
+    def _rebuild_dr_item_controls(self):
+        """Refill the item dropdown and bracket checkboxes from the latest tally, keeping the
+        user's current item choice and unticked brackets."""
+        by_item = {}
+        for item, boss, _b in self._dr_rates:
+            by_item.setdefault(item, set()).add(boss)
+        combo = self.dr_item_combo
+        prev = combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        for item in sorted(by_item):
+            bosses = sorted(by_item[item])
+            if len(bosses) > 1:
+                combo.addItem(f"{item} — all bosses", (item, None))
+            for boss in bosses:
+                combo.addItem(f"{item} — {boss}", (item, boss))
+        idx = combo.findText(prev) if prev else -1
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+        while self.dr_bracket_cb_row.count():
+            w = self.dr_bracket_cb_row.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        lbl = QLabel("Brackets:")
+        lbl.setStyleSheet("color: #aaaaaa; font-size: 12px;")
+        self.dr_bracket_cb_row.addWidget(lbl)
+        self._dr_bracket_cbs = {}
+        for b in self._dr_brackets:
+            cb = QCheckBox(b[1])
+            cb.setChecked(b[1] not in self._dr_unticked_brackets)
+            cb.setStyleSheet("QCheckBox { color: #cccccc; font-size: 12px; background: transparent; }")
+            cb.stateChanged.connect(lambda state, lbl_=b[1]: self._on_dr_bracket_toggled(lbl_, state))
+            self.dr_bracket_cb_row.addWidget(cb)
+            self._dr_bracket_cbs[b] = cb
+        self.dr_bracket_cb_row.addStretch()
+        self._refresh_dr_item()
+
+    def _on_dr_bracket_toggled(self, label, state):
+        (self._dr_unticked_brackets.discard if state else self._dr_unticked_brackets.add)(label)
+        self._refresh_dr_item()
+
+    def _refresh_dr_item(self):
+        choice = self.dr_item_combo.currentData()
+        rows = []
+        if choice is not None:
+            item, boss = choice
+            for b in self._dr_brackets:
+                cb = self._dr_bracket_cbs.get(b)
+                if cb is None or not cb.isChecked():
+                    continue
+                ob = cl = 0
+                for (it, bs, bk), (o, c) in self._dr_rates.items():
+                    if it == item and bk == b and (boss is None or bs == boss):
+                        ob += o
+                        cl += c
+                if cl:
+                    rows.append((b[1], ob, cl))
+        tot_ob, tot_cl = sum(r[1] for r in rows), sum(r[2] for r in rows)
+        avg = tot_ob / tot_cl * 100 if tot_cl else 0
+        self.dr_item_chart.set_ref_line(avg if rows else None)
+        self.dr_item_chart.set_data([(lbl, ob / cl * 100) for lbl, ob, cl in rows])
+        t = self.dr_item_table
+        t.setRowCount(0)
+        for lbl, ob, cl in rows:
+            pct = ob / cl * 100
+            r = t.rowCount()
+            t.insertRow(r)
+            t.setItem(r, 0, QTableWidgetItem(lbl))
+            t.setItem(r, 1, QTableWidgetItem(str(ob)))
+            t.setItem(r, 2, QTableWidgetItem(str(cl)))
+            t.setItem(r, 3, QTableWidgetItem(f"{pct:.1f}%"))
+            diff = QTableWidgetItem(f"{pct - avg:+.1f} pts")
+            diff.setForeground(QColor("#2ecc71" if pct >= avg else "#ff6666"))
+            t.setItem(r, 4, diff)
+        t.setFixedHeight(t.horizontalHeader().sizeHint().height()
+                         + sum(t.rowHeight(r) for r in range(t.rowCount())) + 6)
 
     def _refresh_dr_overall(self):
         visible = {cat for cat, cb in self.dr_cat_cbs.items() if cb.isChecked()}
@@ -3219,19 +3397,26 @@ class BossTrackerApp(QMainWindow):
         """Current/future weeks only count once the character is marked Done; past weeks always count."""
         return week_key < self.actual_current_week_key or f"{char_id}|{week_key}" in self.char_completed_weeks
 
+    def _counted_bosses(self, char_id, week_key, ignore_completion=False):
+        """Active bosses whose crystal counts this week. Past weeks: all of them. Current/future
+        weeks: the regular bosses once the character is marked Done, and Seren — tracked on its
+        own like Black Mage — only once its Overview checkmark is ticked."""
+        active = self._active_bosses(char_id, week_key)
+        if ignore_completion or week_key < self.actual_current_week_key:
+            return active
+        char_done = f"{char_id}|{week_key}" in self.char_completed_weeks
+        seren_done = f"{char_id}|{week_key}" in self.seren_completed_weeks
+        return [b for b in active if (seren_done if b[0] == _SEREN_PATH else char_done)]
+
     def calculate_weekly_crystal_meso(self, char_id, week_key, ignore_completion=False):
-        if not ignore_completion and not self._week_is_locked(char_id, week_key):
-            return 0
         meso_values = sorted(
             (BOSS_DIFFICULTY_MAP.get(key, {}).get(s["difficulty"], 0) // max(s.get("party_size", 1), 1)
-             for _p, key, _r, s, _i in self._active_bosses(char_id, week_key)),
+             for _p, key, _r, s, _i in self._counted_bosses(char_id, week_key, ignore_completion)),
             reverse=True)
         return sum(meso_values[:14])
 
     def calculate_weekly_crystal_count(self, char_id, week_key):
-        if not self._week_is_locked(char_id, week_key):
-            return 0
-        return min(len(self._active_bosses(char_id, week_key)), 14)
+        return min(len(self._counted_bosses(char_id, week_key)), 14)
 
     def calculate_blackmage_monthly_meso(self, char_id, year, month):
         """Sum Black Mage crystal meso for this character's clear(s) tagged to this calendar month.
@@ -3412,18 +3597,20 @@ class BossTrackerApp(QMainWindow):
             done_included = [c for c in included_chars if c["id"] in done_ids]
             done_excluded = [c for c in excluded_chars if c["id"] in done_ids]
 
-            week_meso = sum(self.calculate_weekly_crystal_meso(c["id"], self.actual_current_week_key) for c in done_included)
+            # Per-character totals already include only what counts (Done bosses + a ticked Seren),
+            # so sum everyone — a ticked Seren counts even before its character is marked Done.
+            week_meso = sum(self.calculate_weekly_crystal_meso(c["id"], self.actual_current_week_key) for c in included_chars)
             bm_week_meso = sum(self.calculate_weekly_blackmage_meso(c["id"], self.actual_current_week_key) for c in included_chars)
             self.completed_summary_label.setText(
                 f"Completed this week: {len(done_included)}/{len(included_chars)} characters  •  Meso: {_fmt_meso_short(week_meso + bm_week_meso)}")
 
-            week_crystal_count = sum(self.calculate_weekly_crystal_count(c["id"], self.actual_current_week_key) for c in done_included)
+            week_crystal_count = sum(self.calculate_weekly_crystal_count(c["id"], self.actual_current_week_key) for c in included_chars)
             bm_week_count = sum(len(self._blackmage_entries_for_week(c["id"], self.actual_current_week_key)) for c in included_chars)
             self.crystals_sold_label.setText(
                 f"Crystals sold this week: {week_crystal_count + bm_week_count}")
 
             if excluded_chars:
-                excluded_meso = sum(self.calculate_weekly_crystal_meso(c["id"], self.actual_current_week_key) for c in done_excluded)
+                excluded_meso = sum(self.calculate_weekly_crystal_meso(c["id"], self.actual_current_week_key) for c in excluded_chars)
                 self.completed_summary_excluded_label.setText(
                     f"CW Completed this week: {len(done_excluded)}/{len(excluded_chars)} characters  •  Meso: {_fmt_meso_short(excluded_meso)}")
                 self.completed_summary_excluded_label.setVisible(True)
@@ -3451,6 +3638,11 @@ class BossTrackerApp(QMainWindow):
                 blackmage_edit_cb=(lambda cid=char["id"]: self.edit_blackmage_month(cid)),
                 drop_rate=self._drop_rate_at_week(char["id"], self.actual_current_week_key),
                 drop_rate_cb=self.set_char_drop_rate,
+                seren_state=self._seren_state(char["id"]),
+                seren_done=f"{char['id']}|{self.actual_current_week_key}" in self.seren_completed_weeks,
+                seren_click_cb=(lambda cid=char["id"]: self.toggle_seren_done(cid)),
+                seren_auto=char.get("seren_auto", False),
+                seren_auto_cb=(lambda cid=char["id"]: self.toggle_seren_auto(cid)),
             ), row, 0)
             for col, w in enumerate(weeks, start=1):
                 cell = DynamicCalendarCell(char["id"], w["key"], w["is_current"], self.drop_loot_callback,
@@ -4422,18 +4614,59 @@ class BossTrackerApp(QMainWindow):
         self.save_data()
         self.update_overview_calendar()
 
+    def _seren_state(self, char_id):
+        """Seren's schedule entry for this character this week, or None if Seren isn't on it."""
+        state, _ = self.resolve_boss_state_at_week(char_id, self.actual_current_week_key, _SEREN_PATH)
+        return None if not state or state.get("is_deleted_marker", False) else state
+
+    def _auto_complete_seren(self, char_id):
+        """Tick Seren off this week if it's scheduled with a small party (bigger parties are checked by hand)."""
+        if self._seren_follows_done(char_id):
+            self.seren_completed_weeks.add(f"{char_id}|{self.actual_current_week_key}")
+
+    def _seren_follows_done(self, char_id):
+        """True when this character's Seren is ticked/unticked together with Mark Done (solo, or skip ON).
+        Party Seren without skip is only ever changed by clicking its icon."""
+        state = self._seren_state(char_id)
+        if not state:
+            return False
+        char = next((c for c in self.characters if c["id"] == char_id), {})
+        return bool(char.get("seren_auto")) or state.get("party_size", 1) <= SEREN_AUTO_COMPLETE_MAX_PARTY
+
+    def toggle_seren_auto(self, char_id):
+        """Per-character 'skip the manual Seren step': Complete All / Mark Done tick Seren off whatever the party size."""
+        for c in self.characters:
+            if c["id"] == char_id:
+                c["seren_auto"] = not c.get("seren_auto", False)
+                break
+        self.save_data()
+        self.update_overview_calendar()
+
+    def toggle_seren_done(self, char_id):
+        key = f"{char_id}|{self.actual_current_week_key}"
+        if key in self.seren_completed_weeks:
+            self.seren_completed_weeks.discard(key)
+        else:
+            self.seren_completed_weeks.add(key)
+        self.save_data()
+        self.update_overview_calendar()
+
     def toggle_char_complete(self, char_id):
         key = f"{char_id}|{self.actual_current_week_key}"
         if key in self.char_completed_weeks:
             self.char_completed_weeks.discard(key)
+            if self._seren_follows_done(char_id):
+                self.seren_completed_weeks.discard(key)
         else:
             self.char_completed_weeks.add(key)
+            self._auto_complete_seren(char_id)
         self.save_data()
         self.update_overview_calendar()
 
     def complete_all_characters(self):
         for char in self.characters:
             self.char_completed_weeks.add(f"{char['id']}|{self.actual_current_week_key}")
+            self._auto_complete_seren(char["id"])
         self.save_data()
         self.update_overview_calendar()
 
@@ -6622,6 +6855,7 @@ class BossTrackerApp(QMainWindow):
         if char_id in self.pitched_tracked_chars:
             self.pitched_tracked_chars.remove(char_id)
         self.char_completed_weeks = {k for k in self.char_completed_weeks if not k.startswith(f"{char_id}|")}
+        self.seren_completed_weeks = {k for k in self.seren_completed_weeks if not k.startswith(f"{char_id}|")}
         for tasks in list(self.char_tasks.values()) + [self.global_tasks]:
             for task in tasks:
                 link = task.get("linked")
