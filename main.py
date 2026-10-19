@@ -39,7 +39,7 @@ _BM_PATH = os.path.join(BOSS_ASSETS_DIR, "BlackMage.png")
 _SEREN_PATH = os.path.join(BOSS_ASSETS_DIR, "Seren.png")
 SEREN_AUTO_COMPLETE_MAX_PARTY = 1  # Complete All / Mark Done only tick Seren off for parties this size or smaller
 NUM_WEEKS_TO_SHOW = 4
-APP_VERSION = "v1.33"
+APP_VERSION = "v1.34"
 
 # Item Scanner (F9 tooltip capture/OCR) is built but hidden from the UI for now — flip to True
 # to bring back the tab and the F9 global hotkey. Nothing else needs to change.
@@ -529,6 +529,7 @@ class DynamicCalendarCell(QFrame):
                 self._icon_count += 1
             else:
                 self.main_layout.addWidget(icon_widget)
+            return icon_widget
 
     def add_custom_widget(self, widget):
         if self.wrap_cols:
@@ -2600,6 +2601,9 @@ class BossTrackerApp(QMainWindow):
         layout.addWidget(title)
 
         versions = [
+            ("v1.34", "2026-10-19", [
+                "On a character's boss schedule, bosses that don't count toward the weekly crystals (outside your 14 most valuable, by crystal price ÷ party size) now get a small red X in the corner. Hover the icon to see why.",
+            ]),
             ("v1.33", "2026-10-10", [
                 "Seren now has its own checkmark icon on each character card (next to Black Mage), shown whenever Seren is on that character's schedule this week. Click it to mark Seren done; it resets every week.",
                 "'Complete All' and a card's 'Mark Done' also tick Seren off — but only when Seren is run solo (1 person). With 2+ people it stays open until you click the Seren icon yourself.",
@@ -3678,8 +3682,26 @@ class BossTrackerApp(QMainWindow):
 
             active = self._active_bosses(char_match["id"], w["key"])
             boss_count_by_week[w["key"]] = len(active)
+            # Same ranking as calculate_weekly_crystal_meso: only the 14 priciest crystals sell.
+            by_value = sorted(range(len(active)), reverse=True, key=lambda i: (
+                BOSS_DIFFICULTY_MAP.get(active[i][1], {}).get(active[i][3]["difficulty"], 0)
+                // max(active[i][3].get("party_size", 1), 1)))
+            not_counted = set(by_value[14:])
             for idx, (path, _k, _r, state, is_inherited) in enumerate(active):
-                cell.add_icon(idx, path, False, state["difficulty"], state.get("party_size", 1), is_inherited)
+                icon = cell.add_icon(idx, path, False, state["difficulty"], state.get("party_size", 1), is_inherited)
+                if icon and idx in not_counted:
+                    pix = QPixmap(icon.img_label.pixmap())
+                    p = QPainter(pix)
+                    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+                    x0, x1 = pix.width() - 12, pix.width() - 2
+                    for color, width in (("#000000", 4), ("#ff3333", 2)):  # dark outline, red on top
+                        p.setPen(QPen(QColor(color), width))
+                        p.drawLine(x0, 2, x1, 12)
+                        p.drawLine(x1, 2, x0, 12)
+                    p.end()
+                    icon.img_label.setPixmap(pix)
+                    icon.img_label.setToolTip("Not counted: outside your 14 most valuable crystals this week\n"
+                                              + icon.img_label.toolTip())
 
             # Black Mage is rendered separately (not through the generic single-entry resolver)
             # since the same week can legitimately hold two clears — one for each of two
