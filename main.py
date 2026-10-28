@@ -39,7 +39,7 @@ _BM_PATH = os.path.join(BOSS_ASSETS_DIR, "BlackMage.png")
 _SEREN_PATH = os.path.join(BOSS_ASSETS_DIR, "Seren.png")
 SEREN_AUTO_COMPLETE_MAX_PARTY = 1  # Complete All / Mark Done only tick Seren off for parties this size or smaller
 NUM_WEEKS_TO_SHOW = 4
-APP_VERSION = "v1.34"
+APP_VERSION = "v1.35"
 
 # Item Scanner (F9 tooltip capture/OCR) is built but hidden from the UI for now — flip to True
 # to bring back the tab and the F9 global hotkey. Nothing else needs to change.
@@ -687,14 +687,18 @@ class CharacterProfileCard(QFrame):
         self.reorder_cb = reorder_cb
         self._drag_start_pos = None
 
-        is_excluded = char_data.get("meso_excluded", False)
+        is_retired = char_data.get("retired", False)
+        is_excluded = char_data.get("meso_excluded", False) or is_retired
         self._is_excluded = is_excluded
 
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setStyleSheet(self._normal_style())
         self.setFixedWidth(160)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Left-click / drag: open or reorder\nRight-click: toggle meso exclusion from statistics")
+        self.setToolTip("Left-click / drag: open or reorder\n" + (
+            "Right-click: bring back to the Weekly Tracker" if is_retired else
+            "Right-click: retire (move to the Retired tab — past runs still count)" if is_excluded else
+            "Right-click: move to CW (meso excluded from statistics)"))
         self.setAcceptDrops(True)
 
         layout = QVBoxLayout(self)
@@ -750,7 +754,7 @@ class CharacterProfileCard(QFrame):
             layout.addWidget(task_lbl)
 
         if is_excluded:
-            excl_lbl = QLabel("meso excluded")
+            excl_lbl = QLabel("retired" if is_retired else "CW · meso excluded")
             excl_lbl.setStyleSheet("color: #444444; font-size: 10px; background: transparent; border:none;")
             excl_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             layout.addWidget(excl_lbl)
@@ -1772,7 +1776,7 @@ class BossTrackerApp(QMainWindow):
         changed = False
         for char in self.characters:
             cid = char["id"]
-            if self.saved_boss_clears.get((cid, current_week_key)):
+            if char.get("retired") or self.saved_boss_clears.get((cid, current_week_key)):
                 continue
             # Monthly bosses (Black Mage) never auto-carry forward — they're marked done
             # explicitly, once per run, on whichever week the user checks them off.
@@ -1909,6 +1913,7 @@ class BossTrackerApp(QMainWindow):
         for idx, btn in self._tab_buttons.items():
             btn.setChecked(idx == stack_idx)
         if stack_idx == 0:
+            self._show_retired = False
             self.return_to_overview()
             return
         self.view_stack.setCurrentIndex(stack_idx)
@@ -1945,7 +1950,20 @@ class BossTrackerApp(QMainWindow):
 
         title = QLabel("Weekly Boss Drop Tracker")
         title.setStyleSheet("color: #e67e22; font-size: 20px; font-weight: bold;")
+        self._overview_title = title
         header.addWidget(title)
+        header.addSpacing(12)
+
+        self.char_search = QLineEdit()
+        self.char_search.setPlaceholderText("🔍 Search character…")
+        self.char_search.setClearButtonEnabled(True)
+        self.char_search.setFixedWidth(200)
+        self.char_search.setStyleSheet(
+            "QLineEdit { background-color: #222222; color: #e0e0e0; border: 1px solid #3a3a3a;"
+            " border-radius: 4px; padding: 4px 8px; font-size: 13px; }"
+            "QLineEdit:focus { border: 1px solid #e67e22; }")
+        self.char_search.textChanged.connect(lambda _t: self.update_overview_calendar())
+        header.addWidget(self.char_search)
         header.addStretch()
 
         nav_style = "QPushButton { background-color: #e67e22; color: white; border-radius: 4px; padding: 5px 14px; font-weight: bold; font-size: 14px; } QPushButton:hover { background-color: #d35400; }"
@@ -2003,6 +2021,26 @@ class BossTrackerApp(QMainWindow):
         self.completed_summary_excluded_label.setStyleSheet("color: #999999; font-size: 12px; font-weight: bold; padding: 0 0 4px 2px;")
         self.completed_summary_excluded_label.setVisible(False)
         left_vbox.addWidget(self.completed_summary_excluded_label)
+
+        small_btn = ("QPushButton { background-color: #222222; color: #999999; border: 1px solid #333333;"
+                     " border-radius: 3px; padding: 2px 10px; font-size: 11px; }"
+                     "QPushButton:hover { color: white; border: 1px solid #666666; }"
+                     "QPushButton:checked { background-color: #3a3a3a; color: #e0e0e0; border: 1px solid #888888; }")
+        small_row = QHBoxLayout()
+        small_row.setContentsMargins(2, 0, 0, 4)
+        self.btn_retired_toggle = QPushButton("Retired (0)")
+        self.btn_retired_toggle.setCheckable(True)
+        self.btn_retired_toggle.setStyleSheet(small_btn)
+        self.btn_retired_toggle.setToolTip("Show the characters you don't run anymore (2nd right-click on a card)")
+        self.btn_retired_toggle.clicked.connect(self._toggle_retired_view)
+        small_row.addWidget(self.btn_retired_toggle)
+        btn_drop_search = QPushButton("🔎 Drop Search")
+        btn_drop_search.setStyleSheet(small_btn)
+        btn_drop_search.setToolTip("Search item drops — all characters or one, by item or by category")
+        btn_drop_search.clicked.connect(self.open_drop_search)
+        small_row.addWidget(btn_drop_search)
+        small_row.addStretch()
+        left_vbox.addLayout(small_row)
 
         _ov_container = QWidget()
         _ov_container.setStyleSheet("background-color: transparent;")
@@ -2601,6 +2639,12 @@ class BossTrackerApp(QMainWindow):
         layout.addWidget(title)
 
         versions = [
+            ("v1.35", "2026-10-28", [
+                "Right-clicking a character card now cycles through 3 states: 1st right-click moves it to CW (meso excluded, stays on the Weekly Tracker), 2nd right-click retires it.",
+                "Retired characters (ones you don't run anymore) leave the Weekly Tracker and are shown with the small 'Retired (N)' button under the weekly totals. Their past runs, drops and meso still count in Statistics; they're skipped by 'Complete All', new-week auto-fill and the 'Completed this week' lines. Right-click a retired card to bring it back.",
+                "New '🔎 Drop Search' button under the weekly totals: list every logged item drop for all characters or one, filtered by category and/or a specific item, with obtained / logged totals.",
+                "New search box on the Weekly Tracker (and Retired tab): type part of a name to show only matching characters.",
+            ]),
             ("v1.34", "2026-10-19", [
                 "On a character's boss schedule, bosses that don't count toward the weekly crystals (outside your 14 most valuable, by crystal price ÷ party size) now get a small red X in the corner. Hover the icon to see why.",
             ]),
@@ -3590,14 +3634,22 @@ class BossTrackerApp(QMainWindow):
         for col, w in enumerate(weeks, start=1):
             self.overview_grid.addWidget(self.create_week_header_widget(w), 0, col, Qt.AlignmentFlag.AlignCenter)
 
-        undone = [c for c in self.characters if f"{c['id']}|{self.actual_current_week_key}" not in self.char_completed_weeks]
-        done   = [c for c in self.characters if f"{c['id']}|{self.actual_current_week_key}" in self.char_completed_weeks]
+        show_retired = getattr(self, "_show_retired", False)
+        query = self.char_search.text().strip().lower() if hasattr(self, "char_search") else ""
+        self._overview_title.setText("Retired Characters" if show_retired else "Weekly Boss Drop Tracker")
+        active = [c for c in self.characters if not c.get("retired")]
+        self.btn_retired_toggle.setChecked(show_retired)
+        self.btn_retired_toggle.setText(f"Retired ({len(self.characters) - len(active)})")
+        shown = [c for c in self.characters if bool(c.get("retired")) == show_retired
+                 and query in c["name"].lower()]
+        undone = [c for c in shown if f"{c['id']}|{self.actual_current_week_key}" not in self.char_completed_weeks]
+        done   = [c for c in shown if f"{c['id']}|{self.actual_current_week_key}" in self.char_completed_weeks]
         sorted_chars = undone + done
 
         if hasattr(self, 'completed_summary_label'):
-            done_ids = {c["id"] for c in done}
-            included_chars = [c for c in self.characters if not self._is_char_excluded_at_week(c["id"], self.actual_current_week_key)]
-            excluded_chars = [c for c in self.characters if self._is_char_excluded_at_week(c["id"], self.actual_current_week_key)]
+            done_ids = {c["id"] for c in active if f"{c['id']}|{self.actual_current_week_key}" in self.char_completed_weeks}
+            included_chars = [c for c in active if not self._is_char_excluded_at_week(c["id"], self.actual_current_week_key)]
+            excluded_chars = [c for c in active if self._is_char_excluded_at_week(c["id"], self.actual_current_week_key)]
             done_included = [c for c in included_chars if c["id"] in done_ids]
             done_excluded = [c for c in excluded_chars if c["id"] in done_ids]
 
@@ -4687,6 +4739,8 @@ class BossTrackerApp(QMainWindow):
 
     def complete_all_characters(self):
         for char in self.characters:
+            if char.get("retired"):
+                continue
             self.char_completed_weeks.add(f"{char['id']}|{self.actual_current_week_key}")
             self._auto_complete_seren(char["id"])
         self.save_data()
@@ -4748,13 +4802,103 @@ class BossTrackerApp(QMainWindow):
         self.save_data()
         self.update_overview_calendar()
 
+    def _toggle_retired_view(self):
+        self._show_retired = not getattr(self, "_show_retired", False)
+        self.return_to_overview()
+
+    def open_drop_search(self):
+        """Every logged item drop, filtered by character / category / item."""
+        names = {c["id"]: c["name"] + (" (retired)" if c.get("retired") else "") for c in self.characters}
+        boss_names = {key: disp for _p, key, disp in _boss_files()}
+        state_text = {0: "Obtained", 1: "Not collected", 2: "Ignored"}
+        rows = []  # (week, char_id, item, category, boss, state)
+        for (cid, wkey), items in self.saved_item_drops.items():
+            if cid not in names:
+                continue
+            for it in items:
+                item = os.path.splitext(os.path.basename(it["path"]))[0]
+                bkey, _, diff = (it.get("boss_key") or "").partition("|")
+                boss = f"{boss_names.get(bkey, bkey)} ({diff})" if bkey else "—"
+                rows.append((wkey, cid, item, _item_category(item), boss, _item_state(it)))
+        rows.sort(key=lambda r: r[0], reverse=True)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Drop Search")
+        dlg.resize(820, 560)
+        dlg.setStyleSheet("QDialog { background-color: #161616; } QLabel { color: #e0e0e0; }"
+                          " QComboBox { background-color: #222222; color: #e0e0e0; border: 1px solid #3a3a3a;"
+                          " border-radius: 3px; padding: 3px 6px; min-width: 150px; }")
+        lay = QVBoxLayout(dlg)
+        filters = QHBoxLayout()
+        cb_char, cb_cat, cb_item = QComboBox(), QComboBox(), QComboBox()
+        cb_char.addItem("All characters", None)
+        for c in self.characters:
+            cb_char.addItem(names[c["id"]], c["id"])
+        cb_cat.addItem("All categories", None)
+        for cat, _color, _n in ITEM_CATEGORIES:
+            cb_cat.addItem(cat, cat)
+        for label, cb in (("Character:", cb_char), ("Category:", cb_cat), ("Item:", cb_item)):
+            filters.addWidget(QLabel(label))
+            filters.addWidget(cb)
+        filters.addStretch()
+        lay.addLayout(filters)
+        summary = QLabel("")
+        summary.setStyleSheet("color: #2ecc71; font-weight: bold; padding: 4px 0;")
+        lay.addWidget(summary)
+        table = QTableWidget(0, 5)
+        table.setHorizontalHeaderLabels(["Week", "Character", "Item", "Boss", "Status"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setStyleSheet("QTableWidget { background-color: #1a1a1a; color: #e0e0e0; gridline-color: #2a2a2a; }"
+                            " QHeaderView::section { background-color: #252525; color: #e67e22; font-weight: bold; }")
+        lay.addWidget(table)
+
+        def fill_items():
+            cat, keep = cb_cat.currentData(), cb_item.currentData()
+            cb_item.blockSignals(True)
+            cb_item.clear()
+            cb_item.addItem("All items", None)
+            for item in sorted({r[2] for r in rows if cat is None or r[3] == cat}, key=str.lower):
+                cb_item.addItem(item, item)
+            cb_item.setCurrentIndex(max(cb_item.findData(keep), 0))
+            cb_item.blockSignals(False)
+
+        def refresh():
+            cid, cat, item = cb_char.currentData(), cb_cat.currentData(), cb_item.currentData()
+            hits = [r for r in rows if (cid is None or r[1] == cid) and (cat is None or r[3] == cat)
+                    and (item is None or r[2] == item)]
+            got = sum(1 for r in hits if r[5] == 0)
+            summary.setText(f"{got} obtained  •  {len(hits)} drops logged"
+                            f"  •  {len({(r[0], r[1]) for r in hits})} character-weeks")
+            table.setRowCount(len(hits))
+            for i, (wkey, rcid, it, _cat, boss, st) in enumerate(hits):
+                for col, text in enumerate((wkey, names[rcid], it, boss, state_text.get(st, "?"))):
+                    table.setItem(i, col, QTableWidgetItem(text))
+
+        cb_cat.currentIndexChanged.connect(lambda _i: (fill_items(), refresh()))
+        cb_char.currentIndexChanged.connect(lambda _i: refresh())
+        cb_item.currentIndexChanged.connect(lambda _i: refresh())
+        fill_items()
+        refresh()
+        dlg.exec()
+
     def toggle_meso_exclude(self, char_id):
+        """Right-click cycle: normal → CW (meso excluded) → retired → normal.
+        Retired chars stay in self.characters so their past runs still count in statistics."""
         for c in self.characters:
             if c["id"] == char_id:
-                new_state = not c.get("meso_excluded", False)
-                c["meso_excluded"] = new_state
-                history = self.char_exclusion_history.setdefault(char_id, [])
-                history.append({"week_key": self.actual_current_week_key, "excluded": new_state})
+                if c.get("retired"):
+                    c["retired"] = False
+                    new_state = False
+                elif c.get("meso_excluded", False):
+                    c["retired"] = True
+                    break
+                else:
+                    new_state = True
+                if new_state != c.get("meso_excluded", False):
+                    c["meso_excluded"] = new_state
+                    history = self.char_exclusion_history.setdefault(char_id, [])
+                    history.append({"week_key": self.actual_current_week_key, "excluded": new_state})
                 break
         self.save_data()
         self._stats_dirty = True
