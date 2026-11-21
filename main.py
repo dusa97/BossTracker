@@ -39,7 +39,7 @@ _BM_PATH = os.path.join(BOSS_ASSETS_DIR, "BlackMage.png")
 _SEREN_PATH = os.path.join(BOSS_ASSETS_DIR, "Seren.png")
 SEREN_AUTO_COMPLETE_MAX_PARTY = 1  # Complete All / Mark Done only tick Seren off for parties this size or smaller
 NUM_WEEKS_TO_SHOW = 4
-APP_VERSION = "v1.35"
+APP_VERSION = "v1.36"
 
 # Item Scanner (F9 tooltip capture/OCR) is built but hidden from the UI for now — flip to True
 # to bring back the tab and the F9 global hotkey. Nothing else needs to change.
@@ -177,7 +177,7 @@ BOSS_DROPS = {
     ("limbo", "Hard"):              ["Grindstone of Faith", "Eternal Armor Box (Limbo)", "Life Boss Ring Box", "Whisper of the Source"],
     ("malefic star", "Normal"):     ["Grindstone of Life"],
     ("malefic star", "Hard"):       ["Grindstone of Faith", "Eternal Armor Box (Kalos)", "Life Boss Ring Box", "Blissful Nightmare"],
-    ("jupiter", "Normal"):          ["Grindstone of Faith"],
+    ("jupiter", "Normal"):          ["Grindstone of Faith", "Life Boss Ring Box"],
     ("jupiter", "Hard"):            ["Grindstone of Faith", "Eternal Armor Box (Limbo)", "Life Boss Ring Box", "Original Sin of Pride"],
 }
 
@@ -2639,6 +2639,9 @@ class BossTrackerApp(QMainWindow):
         layout.addWidget(title)
 
         versions = [
+            ("v1.36", "2026-11-21", [
+                "Normal Jupiter can now drop Life Boss Ring Box (already on Hard Jupiter), so it counts in drop rates, statistics and Drop Search.",
+            ]),
             ("v1.35", "2026-10-28", [
                 "Right-clicking a character card now cycles through 3 states: 1st right-click moves it to CW (meso excluded, stays on the Weekly Tracker), 2nd right-click retires it.",
                 "Retired characters (ones you don't run anymore) leave the Weekly Tracker and are shown with the small 'Retired (N)' button under the weekly totals. Their past runs, drops and meso still count in Statistics; they're skipped by 'Complete All', new-week auto-fill and the 'Completed this week' lines. Right-click a retired card to bring it back.",
